@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+xla*/
+
+# Cython-generated C sources (must not be committed: stale .c causes cythonize
+# to skip re-transpilation on remote workers, producing a .so built from an old
+# version of the .pyx)
+dataset/builder/_fast_parse.c
+src/flare/data/processing/native/_scan.c
+
+# Caches and temporary files
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.swp
+*~
+.DS_Store
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+*.bak/
+
+# Build and Packaging
+build/
+dist/
+*.egg-info/
+
+# Data and Artifacts
+/dataset/data/*
+/data/
+*.lance*
+*.log*
+
+# Private Recipe Assets (to be split into private repository)
+# recipes/
+/config/
+tools/copybara/
+
+
+# Project Specific Directories
+/xla/
+/profiler/
+/tmp/
+/backup/
+/out/
+internal_docs/*
+tmp*
+
+# IDEs and Editors
+.vscode/
+.idea/
+.history/
+
+# AI Agents and Tools
+.claude/
+.gemini/
+.agents/
+.qoder/
+.codex/
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Cargo local configs
+.cargo/config.toml

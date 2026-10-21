@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "Cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+search-path = [
+    "/opt/jax",
+    "/opt/flax",
+    "/workspace",
+    "/workspace/fluxway",
+]
+replace-imports-with-any = [
+    "numba.typed",
+    "pyarrow.compute",
+]
+
+[tool.ruff.lint]
+extend-ignore = ["E402"]
