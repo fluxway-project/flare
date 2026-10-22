@@ -19,13 +19,14 @@ For an in-depth architectural breakdown, please refer to the documents in `docs/
 - [Sharded Optimizer Capabilities](docs/sharded_optimizer_capability.md) ([中文](docs/sharded_optimizer_capability_zh.md))
 - [Training Execution Preparation](docs/training_execution_preparation.md) ([中文](docs/training_execution_preparation_zh.md))
 - [Mesh and Inference Weights](docs/mesh_and_inference.md) ([中文](docs/mesh_and_inference_zh.md))
+- [Recommendation Recipes](recipes/recsys/README.md): application task injection, shared training/evaluation graphs and a synthetic CPU example.
 
 ## Installation
 
 ### Prerequisites
 
 - Linux (x86_64 or aarch64)
-- Python >= 3.10
+- Python >= 3.12
 - CUDA 12+ (for GPU acceleration)
 
 ### Building from Source

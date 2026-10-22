@@ -9,15 +9,14 @@ import pytest
 import tyro
 from fluxway.common.types.tensor import TransportTensor
 
+from recipes.recsys.ranking.benchmark.config import RankingThroughputBenchmarkConfigBase
+from recipes.recsys.ranking.benchmark.metrics import summarize_sink_reports
 from recipes.recsys.ranking.benchmark.throughput_sink import ThroughputSinkSPMD
 from recipes.recsys.ranking.workers.reader import resolve_reader_async_policy
-from recipes.whw.util.config import ModelEnum, ThroughputBenchmarkConfig
-from recipes.whw.util.throughput_metrics import summarize_sink_reports
 
 
 def make_config(**overrides):
     values = {
-        "conf_version": ModelEnum.conf_geek_predict_gpu_mix_op_s2_test,
         "reader_workers": 24,
         "dp": 8,
         "samples_per_input_step": 6144,
@@ -25,7 +24,7 @@ def make_config(**overrides):
         "storage_format": "iceberg",
     }
     values.update(overrides)
-    return ThroughputBenchmarkConfig(**values)
+    return RankingThroughputBenchmarkConfigBase(**values)
 
 
 def make_reports():
@@ -61,8 +60,6 @@ def test_batch_is_derived_and_cli_rejects_global_override():
     with pytest.raises(TypeError):
         make_config(batch_size=6144)
     arguments = [
-        "--conf-version",
-        config.conf_version.name,
         "--reader-workers",
         "24",
         "--dp",
@@ -74,13 +71,19 @@ def test_batch_is_derived_and_cli_rejects_global_override():
         "--storage-format",
         "iceberg",
     ]
-    assert tyro.cli(ThroughputBenchmarkConfig, args=arguments).batch_size == 49152
+    assert (
+        tyro.cli(RankingThroughputBenchmarkConfigBase, args=arguments).batch_size
+        == 49152
+    )
     with pytest.raises(SystemExit) as caught:
-        tyro.cli(ThroughputBenchmarkConfig, args=[*arguments, "--batch-size", "6144"])
+        tyro.cli(
+            RankingThroughputBenchmarkConfigBase,
+            args=[*arguments, "--batch-size", "6144"],
+        )
     assert caught.value.code != 0
     with pytest.raises(SystemExit) as caught:
         tyro.cli(
-            ThroughputBenchmarkConfig,
+            RankingThroughputBenchmarkConfigBase,
             args=[*arguments, "--reader-unit-size", "6144"],
         )
     assert caught.value.code != 0

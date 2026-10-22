@@ -300,14 +300,14 @@ def test_update_does_not_capture_audit_without_execution_tracer() -> None:
 
 
 def test_extract_sparse_groups_and_dimensions_numeric_ordering() -> None:
-    ae11_input = {
+    sparse_input = {
         "hashed_sparse_dim_128": ["feat_128"],
         "hashed_sparse_dim_40": ["feat_40"],
         "hashed_sparse_dim_418": ["feat_418"],
         "hashed_sparse_dim_352": ["feat_352"],
         "hashed_sparse_dim_140": ["feat_140"],
     }
-    groups, dims_by_base = extract_sparse_groups_and_dimensions(ae11_input)
+    groups, dims_by_base = extract_sparse_groups_and_dimensions(sparse_input)
 
     assert groups == (
         "hashed_sparse_dim_128",
@@ -374,4 +374,3 @@ def test_parse_sparse_workers_contracts() -> None:
         parse_sparse_workers("t1:2,t1:4", groups)
     with pytest.raises(ValueError, match="must be positive"):
         parse_sparse_workers("t1:0", groups)
-

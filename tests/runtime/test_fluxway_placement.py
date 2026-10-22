@@ -111,11 +111,11 @@ def _ranking_recipe(graph, refs, policy):
             "exp_id": refs["Exp"],
             "hashed_sparse": refs["Hashed"],
             "job_id": refs["Job"],
-            "geek_id": refs["Geek"],
-            "boss_id": refs["Boss"],
+            "isolated_table_a": refs["Geek"],
+            "isolated_table_b": refs["Boss"],
         },
         compute_spmd=refs["Ranking"],
-        excluded_affinity_tables=frozenset({"geek_id", "boss_id"}),
+        excluded_affinity_tables=frozenset({"isolated_table_a", "isolated_table_b"}),
         policy=policy,
     )
 

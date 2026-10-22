@@ -185,10 +185,10 @@ def test_assigned_reader_preserves_catalog_token_option() -> None:
         source_read_concurrency=1,
         storage_options={
             "storage_format": "iceberg",
-            "catalog_name": "gray_metalake",
+            "catalog_name": "test_metalake",
             "catalog_type": "rest",
             "catalog_uri": "http://catalog.example/iceberg",
-            "table_identifier": "throughput.whw_input_graph",
+            "table_identifier": "throughput.input_graph",
             "catalog_token": "test-token",
         },
     )

@@ -21,8 +21,7 @@ def _calls_named(source: str, name: str) -> list[ast.Call]:
 
 def test_input_graph_calls_forward_owner_key_dtype() -> None:
     paths = (
-        ROOT / "recipes/ae11/util/fluxway_topology.py",
-        ROOT / "recipes/whw/util/fluxway_topology.py",
+        ROOT / "recipes/recsys/ranking/graph/pipeline.py",
         ROOT / "recipes/recsys/ranking/benchmark/pipeline.py",
     )
     for path in paths:

@@ -1,0 +1,3 @@
+sparse_embedding
+scikit-learn
+tensorboardX

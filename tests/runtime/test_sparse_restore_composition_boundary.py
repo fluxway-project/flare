@@ -67,46 +67,25 @@ def test_sparse_worker_consumes_composition_bound_restore_bytes() -> None:
 
 
 def test_recipe_passes_restore_plans_without_reconstructing_them() -> None:
-    for recipe in ("ae11", "whw"):
-        source = (ROOT / f"recipes/{recipe}/util/fluxway_topology.py").read_text(
-            encoding="utf-8"
-        )
-        assert "restore_payloads_by_partition" in source
-        assert "bind_sparse_embedding_worker_restore_plans(" in source
-        assert "restore_plans_by_partition=restore_plans_by_partition" in source
-        assert "PartitionSpec" in source
-        assert "key_dtype" in source
-        assert '"key_dtype": common.key_dtype' in source
-        assert "router_descriptor" not in source
-        assert "RouterDescriptor" not in source
-        assert "sparse_adapter.restore_payload" not in source
-
-
-def test_recipe_fluxway_entrypoints_bind_owner_assignment_and_dtype() -> None:
-    expected_key_dtype = {"ae11": "int64", "whw": "int64"}
-    for recipe in ("ae11", "whw"):
-        scripts = ROOT / f"recipes/{recipe}/scripts/fluxway_scripts"
-        for script_name in ("eval.py", "train.py", "export_graph_visualization.py"):
-            source = (scripts / script_name).read_text(encoding="utf-8")
-            assert "PartitionSpec.modulo()" in source
-            assert f'"{expected_key_dtype[recipe]}"' in source
-            assert "router_descriptor" not in source
-            assert "RouterDescriptor" not in source
-
-        topology = (ROOT / f"recipes/{recipe}/util/fluxway_topology.py").read_text(
-            encoding="utf-8"
-        )
-        assert "sparse_partition_assignment_spec: PartitionSpec" in topology
-        assert "key_dtype: str" in topology
-        assert "key_dtype=key_dtype" in topology
+    source = (ROOT / "recipes/recsys/ranking/graph/pipeline.py").read_text(
+        encoding="utf-8"
+    )
+    assert "restore_payloads_by_partition" in source
+    assert "bind_sparse_embedding_worker_restore_plans(" in source
+    assert "restore_plans_by_partition=restore_plans_by_partition" in source
+    assert "sparse_partition_assignment_spec: PartitionSpec" in source
+    assert '"key_dtype": common.key_dtype' in source
+    assert "key_dtype=key_dtype" in source
+    assert "router_descriptor" not in source
+    assert "RouterDescriptor" not in source
+    assert "sparse_adapter.restore_payload" not in source
 
 
 def test_flare_does_not_import_private_sparse_checkpoint_apis() -> None:
     paths = [
         *((ROOT / "src/flare/inference").rglob("*.py")),
         *((ROOT / "src/flare/runtime/fluxway").rglob("*.py")),
-        *((ROOT / "recipes/ae11").rglob("*.py")),
-        *((ROOT / "recipes/whw").rglob("*.py")),
+        *((ROOT / "recipes/recsys").rglob("*.py")),
     ]
     forbidden = (
         "sparse_embedding._core.checkpoint",
