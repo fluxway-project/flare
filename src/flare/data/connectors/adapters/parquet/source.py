@@ -58,7 +58,11 @@ class ParquetSourceAdapter(FileListSourceAdapter):
         *,
         batch_size: int,
     ) -> Iterator[pa.RecordBatch]:
-        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size <= 0
+        ):
             raise ValueError("file source batch_size must be a positive integer")
         if record_range.source_identity != self.source_identity:
             raise ValueError("record range belongs to another file-list source")

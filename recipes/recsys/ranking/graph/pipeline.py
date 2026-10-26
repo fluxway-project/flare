@@ -8,6 +8,7 @@ from fluxway.common.types.checkpoint import CheckpointRetentionPolicy
 from fluxway.control_plane.ingestion import AssignmentPolicy
 from sparse_embedding.checkpoint import PartitionSpec
 
+from flare.data.contracts.lineage import LineageConfig
 from flare.data.pipeline.consumption.source.contracts.source import SourceFactory
 from flare.data.schema.feature_catalog import FeatureCatalog, FeatureOutputKind
 from flare.data.schema.feature_layout import build_training_feature_layout
@@ -76,6 +77,7 @@ def build_pipeline_nodes(
     *,
     source_factory: SourceFactory,
     manifest_source_enabled: bool,
+    source_lineage: LineageConfig | None = None,
     optimizer_enabled: bool,
     load_optimizer_state: bool,
     retention_policy: CheckpointRetentionPolicy,
@@ -159,6 +161,7 @@ def build_pipeline_nodes(
             )
         source_descriptor = WorkItemScheduledDatasetSourceDescriptor(
             source_factory=source_factory,
+            lineage=source_lineage,
             global_batch_size=args.global_batch_size,
             completion_policy=args.completion_policy,
             source_assignment_policy=source_assignment_policy_map[
@@ -231,6 +234,7 @@ def build_pipeline_inputs(
     mb: Any,
     side_info_seq: Any,
     args: Any,
+    catalog_token: str | None,
     common: PipelineNodes,
     sparse_workers_config: Mapping[str, int],
     repeat_first_batch: bool,
@@ -310,7 +314,7 @@ def build_pipeline_inputs(
             "warehouse": args.warehouse,
             "iceberg_config": args.iceberg_config,
             "iceberg_snapshot_id": args.iceberg_snapshot_id,
-            "catalog_token": args.catalog_token,
+            "catalog_token": catalog_token,
             "table_identifier": args.table_identifier,
             "iceberg_max_open_files": args.iceberg_max_open_files,
         },

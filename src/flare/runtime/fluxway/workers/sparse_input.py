@@ -5,6 +5,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+# pyrefly: ignore[missing-import]
 import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import PartitionSpec
@@ -151,7 +152,9 @@ class InputSPMD:
             )
         )
         for resource_id in resource_ids:
-            register_sparse_partition_resource(resource_id, sparse_partition_assignment_spec)
+            register_sparse_partition_resource(
+                resource_id, sparse_partition_assignment_spec
+            )
         if execution_tracer is not None:
             self.execution_tracer = execution_tracer
             prepare_trace = getattr(execution_tracer, "prepare", None)
@@ -333,9 +336,7 @@ def get_input_spmd_class(
         input_out_shards[f"unique_{g}"] = {
             "type": "dynamic",
             "axis": ["dp"],
-            "strategy": sparse_partition_resource_strategy(
-                f"{base_name}.assignment"
-            ),
+            "strategy": sparse_partition_resource_strategy(f"{base_name}.assignment"),
         }
         input_out_shards[f"inv_{g}"] = {"type": "static", "axis": ["dp"]}
 

@@ -11,13 +11,13 @@ from urllib.parse import urlparse
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyarrow.fs import S3FileSystem
+
 from flare.data.connectors.adapters.iceberg.catalog import (
     build_iceberg_catalog_kwargs,
     load_iceberg_catalog,
 )
 from flare.data.connectors.adapters.iceberg.table import iceberg_table_properties
-from pyarrow.fs import S3FileSystem
-
 from tools.validation.performance_metrics import Measurement, summarize, write_json
 
 

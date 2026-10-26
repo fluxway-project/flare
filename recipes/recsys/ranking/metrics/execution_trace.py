@@ -129,7 +129,9 @@ class RecsysExecutionTracer(JsonlExecutionTracer):
             "rows": local_rows,
             "nnz": _metadata_summary(original_ids)["size"],
             "unique": _trace_summary(unique_ids, include_values=self.include_values),
-            "original": _trace_summary(original_ids, include_values=self.include_values),
+            "original": _trace_summary(
+                original_ids, include_values=self.include_values
+            ),
             "inv": _trace_summary(inverse, include_values=self.include_values),
             "unique_tensor": _descriptor_summary(unique_tensor),
             "inv_tensor": _descriptor_summary(inverse_tensor),

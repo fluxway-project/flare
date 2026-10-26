@@ -7,6 +7,9 @@ from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.manifest import ManifestEntryStatus
 from pyiceberg.table import TableProperties
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.manifest_stream import (
     IcebergManifestTraversal,
 )
@@ -16,6 +19,9 @@ from flare.data.connectors.adapters.iceberg.scan_cursor import (
     ManifestListRef,
 )
 from flare.data.connectors.adapters.iceberg.source import IcebergSourcePlanner
+from flare.data.pipeline.consumption.source.execution.invocation import (
+    read_source_batch,
+)
 
 
 @pytest.fixture(scope="module")
@@ -133,7 +139,7 @@ def test_native_continuous_source_resumes_after_idle_with_no_writer_metadata(
     initial_count = int(table.current_snapshot().summary["total-records"])
     planner = IcebergSourcePlanner(
         table_identifier="test.events",
-        catalog_kwargs=catalog_config,
+        catalog_provider=ConfiguredIcebergCatalogProvider(catalog_config),
         projection=("id",),
         mode=ContinuousAppend(),
     )
@@ -213,7 +219,7 @@ def test_native_ray_consumption_bookmark_replans_with_fresh_source(
     def new_source():
         planner = IcebergSourcePlanner(
             table_identifier="test.events",
-            catalog_kwargs=config,
+            catalog_provider=ConfiguredIcebergCatalogProvider(config),
             projection=("id",),
             mode=PinnedSnapshot(first_id),
         )
@@ -284,12 +290,14 @@ async def test_native_ray_joint_source_checkpoint_reassembles_file_ranges(
     from fluxway.control_plane.source_control import SourceControlRuntime
 
     from flare.data.connectors.adapters.iceberg.modes import PinnedSnapshot
+    from flare.data.connectors.adapters.iceberg.scan import IcebergSourceScanAdapter
     from flare.data.connectors.adapters.iceberg.source import IcebergSourceReader
     from flare.data.connectors.adapters.parquet.range_reader import (
         ParquetInputFileReader,
     )
-    from flare.data.connectors.adapters.iceberg.scan import IcebergSourceScanAdapter
-    from flare.runtime.fluxway.source import AssignedSourceBatchReader
+    from flare.data.pipeline.consumption.source.execution.record_ranges import (
+        RecordRangeReadSession,
+    )
 
     table, first_id, config = native_table
     original_input = type(table.io).new_input
@@ -303,7 +311,7 @@ async def test_native_ray_joint_source_checkpoint_reassembles_file_ranges(
     def source():
         return IcebergSourcePlanner(
             table_identifier="test.events",
-            catalog_kwargs=config,
+            catalog_provider=ConfiguredIcebergCatalogProvider(config),
             projection=("id",),
             mode=PinnedSnapshot(first_id),
         )
@@ -392,10 +400,10 @@ async def test_native_ray_joint_source_checkpoint_reassembles_file_ranges(
             max_steps=1,
         )
         monkeypatch.setattr(type(table.io), "new_input", original_input)
-        reader = AssignedSourceBatchReader(
+        reader = RecordRangeReadSession(
             reader=IcebergSourceReader(
                 table_identifier="test.events",
-                catalog_kwargs=config,
+                catalog_provider=ConfiguredIcebergCatalogProvider(config),
                 projection=("id",),
                 mode=PinnedSnapshot(first_id),
                 format_readers={"parquet": ParquetInputFileReader(max_open_files=2)},
@@ -423,7 +431,9 @@ async def test_native_ray_joint_source_checkpoint_reassembles_file_ranges(
                             key=lambda item: item.global_start,
                         )
                     )
-                    batch = await reader.read(step, work_items=work)
+                    batch = (
+                        await read_source_batch(reader, step, work_items=work)
+                    ).payload
                     restored_rows.extend(batch["id"].to_pylist())
         finally:
             await reader.close()

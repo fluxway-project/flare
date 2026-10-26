@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from flare.data.connectors.adapters.iceberg.scan_cursor import IcebergScanCursor
-from flare.data.connectors.adapters.iceberg.scan_result import FileScanResult
-from flare.data.connectors.adapters.iceberg.source import IcebergSourcePlanner
 from fluxway.common.ingestion import (
     OpaqueSourceCursor,
     SourceScanBudget,
@@ -13,6 +10,10 @@ from fluxway.common.ingestion import (
 )
 from fluxway.common.metadata import metadata_digest, pack_metadata
 from fluxway.control_plane.ingestion import LayoutUnitDescriptor
+
+from flare.data.connectors.adapters.iceberg.scan_cursor import IcebergScanCursor
+from flare.data.connectors.adapters.iceberg.scan_result import FileScanResult
+from flare.data.connectors.adapters.iceberg.source import IcebergSourcePlanner
 
 
 def iceberg_scan_lineage_identity(cursor: IcebergScanCursor) -> str:
@@ -33,6 +34,9 @@ class IcebergSourceScanAdapter:
             raise TypeError("Iceberg scan adapter requires IcebergSourcePlanner")
         self._planner = planner
 
+    def close(self) -> None:
+        self._planner.close()
+
     @property
     def binding_identity(self) -> Mapping[str, str]:
         return self._planner.binding_identity
@@ -44,9 +48,7 @@ class IcebergSourceScanAdapter:
         return OpaqueSourceCursor.from_payload(cursor.encode())
 
     @staticmethod
-    def advance_cursor(
-        cursor: OpaqueSourceCursor, records: int
-    ) -> OpaqueSourceCursor:
+    def advance_cursor(cursor: OpaqueSourceCursor, records: int) -> OpaqueSourceCursor:
         native = IcebergScanCursor.decode(cursor.payload)
         return OpaqueSourceCursor.from_payload(native.advance_records(records).encode())
 
@@ -83,7 +85,7 @@ class IcebergSourceScanAdapter:
                     cardinality_metric="rows",
                     split_policy="SplittableSpan",
                     locality_key=record_range.locator.canonical(),
-                    physical_identity=record_range.locator.canonical(),
+                    storage_locator=record_range.locator.canonical(),
                     logical_start=record_range.record_start,
                     opaque_token=pack_metadata(record_range.to_dict()),
                 )

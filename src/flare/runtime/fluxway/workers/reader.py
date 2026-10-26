@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from builtins import BaseExceptionGroup
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -10,14 +11,19 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 
-from flare.data.schema.batch import RaggedFeatureBatch
-from flare.runtime.fluxway.source import (
-    AssignedSourceBatchReader,
-    WorkItemScheduledDatasetSourceDescriptor,
+from flare.data.pipeline.consumption.source.contracts.source import SourceReadSession
+from flare.data.pipeline.consumption.source.execution.invocation import (
+    invoke_source,
+    read_source_batch,
 )
+from flare.data.pipeline.lineage import LineageRecorder
+from flare.data.schema.batch import RaggedFeatureBatch
+from flare.runtime.fluxway.source import WorkItemScheduledDatasetSourceDescriptor
 from flare.runtime.fluxway.transport import wrap_ragged_feature_batch
 from flare.runtime.fluxway.workers.reader_contracts import ReaderSource
 from fluxway import profiler
+from fluxway.common.async_close import AsyncCloseOnce
+from fluxway.common.async_operations import AsyncOperationSupervisor
 from fluxway.common.decorators import requires_worker_process
 from fluxway.common.index_descriptor import ContinuousIndex
 from fluxway.common.types.checkpoint import (
@@ -106,25 +112,19 @@ class BatchReaderSPMD(BaseReader):
         self._source = source
         self._output_builder = output_builder
         self.repeat_first_batch = repeat_first_batch
-        if execution_audit_path is not None:
-            self._execution_audit_path = execution_audit_path
-            self._execution_audit_records: list[dict[str, Any]] = []
-            self._execution_audit_written = False
+        self._execution_audit_path = execution_audit_path
+        self._execution_audit_records: list[dict[str, Any]] | None = (
+            None if execution_audit_path is None else []
+        )
+        self._execution_audit_written = False
         self._cached_batch: Mapping[str, TransportTensor] | None = None
-        if source.descriptor is not None:
-            self._source_descriptor = source.descriptor
-            self._assigned_source_options = dict(source.options)
-            self._ingestion_read_session = None
-            self._read_chunk_size = None
-        else:
-            self._source_descriptor = None
-            self._assigned_source_options = {}
-            self._ingestion_read_session = source.read_session
-            self._read_chunk_size = source.read_chunk_size
         self._layout_sessions: dict[int, IngestionLayoutSession] = {}
-        self._assigned_session: AssignedSourceBatchReader | None = None
+        self._assigned_session: SourceReadSession | None = None
+        self._lineage_recorder: LineageRecorder | None = None
         self._ingestion_activations: dict[int, IngestionLayoutActivation] = {}
-        self._closed = False
+        self._activation_lock = asyncio.Lock()
+        self._operations = AsyncOperationSupervisor()
+        self._close_once = AsyncCloseOnce(self._finish_close)
 
     def _require_operator_context(self) -> tuple[int, int, int]:
         context = getattr(self, "ctx", None)
@@ -210,8 +210,11 @@ class BatchReaderSPMD(BaseReader):
         return converted
 
     async def read(self) -> Any:
-        if self._closed:
+        if not self._operations.accepting:
             raise RuntimeError("Reader is closed")
+        return await self._operations.run(self._read)
+
+    async def _read(self) -> Any:
         if self.repeat_first_batch and self._cached_batch is not None:
             return self._output_builder(_clone_transport_mapping(self._cached_batch))
 
@@ -245,22 +248,26 @@ class BatchReaderSPMD(BaseReader):
             work_items = self.ctx.source_work_items
             if not work_items:
                 raise RuntimeError("assigned Reader source requires source work items")
-            raw_batch = await self._assigned_session.read(
-                step,
-                work_items=work_items,
+            source_batch = await read_source_batch(
+                self._assigned_session, step, work_items=work_items
             )
+            if self._lineage_recorder is not None and any(
+                not item.is_synthetic_padding for item in work_items
+            ):
+                await self._lineage_recorder.inputs_read(source_batch.inputs)
+            raw_batch = source_batch.payload
         else:
             raise RuntimeError("BatchReaderSPMD has no activated Fluxway source")
 
-        if raw_batch is None:
-            return ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
-
         batch = self.transform_raw_batch(raw_batch)
-        with profiler.scope("reader.to_transport_batch"):
+        if profiler.enabled():
+            with profiler.scope("reader.to_transport_batch"):
+                canonical = self._to_transport_batch(batch, logical_rank, logical_world)
+        else:
             canonical = self._to_transport_batch(batch, logical_rank, logical_world)
         result = self._output_builder(canonical)
 
-        if getattr(self, "_execution_audit_path", None) is not None:
+        if self._execution_audit_records is not None:
             self._execution_audit_records.extend(
                 {
                     "rank": self.rank,
@@ -284,24 +291,32 @@ class BatchReaderSPMD(BaseReader):
 
     def transform_raw_batch(self, raw_batch: Any) -> Mapping[str, Any]:
         """Transform raw batch from storage into a column mapping."""
-        if isinstance(raw_batch, pa.Table):
+        if isinstance(raw_batch, (pa.Table, pa.RecordBatch)):
             return {
-                col: raw_batch.column(col).to_numpy() for col in raw_batch.column_names
+                col: raw_batch.column(col).to_numpy(zero_copy_only=False)
+                for col in raw_batch.column_names
             }
         if isinstance(raw_batch, Mapping):
             return raw_batch
         raise TypeError(
-            f"BatchReaderSPMD batch must be an Arrow table or mapping, got {type(raw_batch).__name__}"
+            "BatchReaderSPMD batch must be an Arrow table, record batch or mapping, "
+            f"got {type(raw_batch).__name__}"
         )
-
-    def _source_options(self) -> dict[str, Any]:
-        return dict(self._assigned_source_options)
 
     async def activate_ingestion_layout(
         self, activation: IngestionLayoutActivation
     ) -> None:
-        if self._closed:
+        if not self._operations.accepting:
             raise RuntimeError("Reader is closed")
+        await self._operations.run(lambda: self._activate_ingestion_layout(activation))
+
+    async def _activate_ingestion_layout(
+        self, activation: IngestionLayoutActivation
+    ) -> None:
+        async with self._activation_lock:
+            await self._activate_locked(activation)
+
+    async def _activate_locked(self, activation: IngestionLayoutActivation) -> None:
         if not isinstance(activation, IngestionLayoutActivation):
             raise TypeError("Reader activation requires IngestionLayoutActivation")
         prior = self._ingestion_activations.get(activation.epoch)
@@ -323,27 +338,37 @@ class BatchReaderSPMD(BaseReader):
                 raise RuntimeError(
                     "ingestion layout cannot replace an active Reader source"
                 )
+            read_session = self._source.read_session
+            chunk_size = self._source.read_chunk_size
+            if read_session is None or chunk_size is None:
+                raise RuntimeError("direct Reader requires a session and chunk size")
             layout_session = IngestionLayoutSession(
                 activation,
-                self._ingestion_read_session,
-                batch_size=self._read_chunk_size,
+                read_session,
+                batch_size=chunk_size,
             )
             self._layout_sessions[activation.epoch] = layout_session
             self._ingestion_activations[activation.epoch] = activation
             return
 
         if self._assigned_session is None:
-            if self._source_descriptor is None:
-                raise RuntimeError("assigned reader source must provide a descriptor")
-            assigned_session = self._source_descriptor.create_session(
-                self._source_options(), pad_batch_factory=self._source.pad_batch_factory
-            )
-            if not isinstance(assigned_session, AssignedSourceBatchReader):
-                raise TypeError(
-                    "source_descriptor.create_session must return AssignedSourceBatchReader"
-                )
-            self._assigned_session = assigned_session
+            await self._open_assigned_session()
         self._ingestion_activations[activation.epoch] = activation
+
+    async def _open_assigned_session(self) -> None:
+        descriptor = self._source.descriptor
+        if descriptor is None:
+            raise RuntimeError("assigned reader source must provide a descriptor")
+        recorder = (
+            None if descriptor.lineage is None else LineageRecorder(descriptor.lineage)
+        )
+        assigned_session = await invoke_source(
+            descriptor.create_session,
+            self._source.options,
+            pad_batch_factory=self._source.pad_batch_factory,
+        )
+        self._assigned_session = assigned_session
+        self._lineage_recorder = recorder
 
     def capture_checkpoint_state(self, context: SaveSession) -> dict[str, Any]:
         if self.repeat_first_batch:
@@ -380,30 +405,36 @@ class BatchReaderSPMD(BaseReader):
             )
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        self._operations.stop_accepting()
+        await self._close_once.close()
+
+    async def _finish_close(self) -> None:
+        failures = list(await self._operations.drain())
         sessions = (
             *self._layout_sessions.values(),
             self._assigned_session,
+            self._lineage_recorder,
         )
-        sessions = tuple(session for session in sessions if session is not None)
         self._layout_sessions.clear()
         self._assigned_session = None
+        self._lineage_recorder = None
+        sessions = tuple(session for session in sessions if session is not None)
         results = await asyncio.gather(
-            *(session.close() for session in sessions),
+            *(invoke_source(session.close) for session in sessions),
             return_exceptions=True,
         )
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        failures.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
+        if failures:
+            raise BaseExceptionGroup("source reader close failed", failures)
 
     async def on_shutdown(self) -> None:
         await self.close()
-        audit_path = getattr(self, "_execution_audit_path", None)
+        audit_path = self._execution_audit_path
         if audit_path is None:
             return
-        if getattr(self, "_execution_audit_written", False):
+        if self._execution_audit_written:
             raise RuntimeError("Reader execution audit was finalized twice")
         target = Path(audit_path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -414,7 +445,7 @@ class BatchReaderSPMD(BaseReader):
             json.dumps(
                 {
                     "rank": self.rank,
-                    "records": getattr(self, "_execution_audit_records", []),
+                    "records": self._execution_audit_records,
                 },
                 indent=2,
                 sort_keys=True,

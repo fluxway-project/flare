@@ -6,9 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import flare.runtime.sparse_precision as sparse_precision
+from flare.runtime import sparse_precision
 from flare.runtime.sparse_precision import prepare_sparse_native_gradient
-
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,9 +33,11 @@ def test_sparse_embedding_trace_and_readback_are_opt_in() -> None:
         "update",
         "flush_pending_updates",
     }
-    source = (ROOT / "src/flare/runtime/fluxway/workers/dynamic_embedding.py").read_text()
+    source = (
+        ROOT / "src/flare/runtime/fluxway/workers/dynamic_embedding.py"
+    ).read_text()
     assert 'getattr(self, "execution_tracer", None)' in source
-    assert 'if validate_tensor_values:' in source
+    assert "if validate_tensor_values:" in source
     assert "_read_embeddings_for_audit" in source
     assert "_traced_gradients" in source
 
@@ -47,7 +48,9 @@ def test_default_sparse_gradient_path_does_not_validate_values(
     def fail_if_called(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("finite validation must be opt-in")
 
-    monkeypatch.setattr(sparse_precision, "require_finite_sparse_values", fail_if_called)
+    monkeypatch.setattr(
+        sparse_precision, "require_finite_sparse_values", fail_if_called
+    )
     result = prepare_sparse_native_gradient(
         np.asarray([[1.0, 2.0]], dtype=np.float32),
         transport_dtype="float32",

@@ -19,7 +19,9 @@ class ModelConfig:
     steps: int = 40
 
 
-def run(config: ModelConfig = ModelConfig()) -> dict[str, object]:
+def run(config: ModelConfig | None = None) -> dict[str, object]:
+    if config is None:
+        config = ModelConfig()
     task = RankingTask(
         label_column="outcome",
         group_id_column="visitor",

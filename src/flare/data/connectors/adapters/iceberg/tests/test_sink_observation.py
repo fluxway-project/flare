@@ -5,6 +5,9 @@ from unittest.mock import patch
 
 import pyarrow as pa
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.observation import (
     IcebergCommitObservation,
     IcebergFileLayout,
@@ -18,7 +21,14 @@ def _publisher(*, observe_file_layout: bool) -> IcebergSnapshotPublisher:
     publisher._table = object()
     publisher._writer_target_size_bytes = 128
     publisher._snapshot_properties = {}
-    publisher._catalog_kwargs = {"name": "catalog"}
+    publisher._catalog_kwargs = {
+        "name": "catalog",
+        "type": "rest",
+        "uri": "http://catalog",
+    }
+    publisher._asset_namespace = ConfiguredIcebergCatalogProvider(
+        publisher._catalog_kwargs
+    ).identity
     publisher._table_identifier = "db.table"
     publisher._observe_file_layout = observe_file_layout
     publisher._write_task_num_cpus = 1.0

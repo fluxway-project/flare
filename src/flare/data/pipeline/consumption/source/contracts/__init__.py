@@ -3,13 +3,15 @@ from flare.data.pipeline.consumption.source.contracts.model import (
 )
 from flare.data.pipeline.consumption.source.contracts.source import (
     ControlledSourceScanAdapter,
+    SourceBatch,
     SourceFactory,
-    SourceReader,
+    SourceReadSession,
 )
 
 __all__ = [
-    "SourceFactory",
-    "SourceReader",
     "ControlledSourceScanAdapter",
+    "SourceBatch",
+    "SourceFactory",
+    "SourceReadSession",
     "SourceRecordRange",
 ]

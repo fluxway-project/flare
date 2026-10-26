@@ -492,8 +492,10 @@ class RecsysBackboneTrainSPMD:
             tracer = getattr(self, "execution_tracer", None)
             if tracer is not None:
                 tracer.module_gradient(
-                    group=group, step=operator_step,
-                    spmd_id="RecsysBackboneTrain", rank=self.rank,
+                    group=group,
+                    step=operator_step,
+                    spmd_id="RecsysBackboneTrain",
+                    rank=self.rank,
                     gradient=grad,
                     inverse=transport_payload(inverse_value),
                     embedding_tensor=emb_ref,
@@ -581,7 +583,8 @@ class RecsysBackboneTrainSPMD:
                 )
             tracer.module_update(
                 step=require_operator_step(self, "RecsysBackboneTrain.update"),
-                spmd_id="RecsysBackboneTrain", rank=self.rank,
+                spmd_id="RecsysBackboneTrain",
+                rank=self.rank,
                 micro_step=update_window.micro_step,
                 grad_accum_steps=self.grad_accum_steps,
                 optimizer_applied=applied,

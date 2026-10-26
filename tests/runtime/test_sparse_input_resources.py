@@ -34,8 +34,6 @@ def test_input_dynamic_routing_uses_registered_assignment_owner() -> None:
     )
 
     output_sharding = bound_input.process._fluxway_operator_spec.output_sharding
-    strategy = output_sharding[
-        "unique_hashed_sparse_dim_4"
-    ].routing.strategy
+    strategy = output_sharding["unique_hashed_sparse_dim_4"].routing.strategy
     assert strategy.target.namespace == "sparse_embedding"
     assert strategy.target.resource_id == "hashed_sparse.assignment"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
@@ -12,16 +13,13 @@ from typing import Any
 import pyarrow as pa
 from pyiceberg.table.snapshots import Operation
 
-from flare.data.connectors.adapters.iceberg.catalog import (
-    load_iceberg_table,
-    normalize_iceberg_catalog_kwargs,
+from flare.data.connectors.adapters.iceberg.access import (
+    IcebergCatalogProvider,
+    IcebergTableSession,
 )
 from flare.data.connectors.adapters.iceberg.identity import (
-    bound_source_identity,
     canonical_digest,
-    require_table_uuid,
     sha256_bytes,
-    validate_table_uuid,
 )
 from flare.data.connectors.adapters.iceberg.manifest_stream import (
     IcebergManifestTraversal,
@@ -98,20 +96,10 @@ def _mode_identity(
     raise TypeError("unsupported Iceberg source mode")
 
 
-def _catalog_identity_kwargs(catalog_kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """Return catalog settings that define data identity, excluding credentials."""
-
-    return {
-        key: value
-        for key, value in catalog_kwargs.items()
-        if key not in {"token", "header.Authorization", "auth"}
-    }
-
-
 @dataclass(frozen=True, slots=True)
 class _IcebergSourceConfig:
     table_identifier: str
-    catalog_kwargs: dict[str, Any]
+    catalog_provider: IcebergCatalogProvider
     projection: tuple[str, ...]
     source_identity: str
     schema_digest: str
@@ -121,7 +109,7 @@ class _IcebergSourceConfig:
         cls,
         *,
         table_identifier: str,
-        catalog_kwargs: Mapping[str, Any],
+        catalog_provider: IcebergCatalogProvider,
         projection: Sequence[str],
         mode_identity: Mapping[str, Any] | None = None,
         row_filter: Mapping[str, Any] | None = None,
@@ -131,10 +119,18 @@ class _IcebergSourceConfig:
         if not projection:
             raise ValueError("projection must not be empty")
         normalized_projection = validate_storage_columns(projection)
-        normalized_catalog = normalize_iceberg_catalog_kwargs(catalog_kwargs)
+        if not isinstance(catalog_provider, IcebergCatalogProvider):
+            raise TypeError("Iceberg source requires IcebergCatalogProvider")
+        namespace = catalog_provider.identity
+        if (
+            not isinstance(namespace, str)
+            or not namespace
+            or namespace.strip() != namespace
+        ):
+            raise ValueError("Iceberg catalog identity must be canonical")
         identity_digest = canonical_digest(
             {
-                "catalog": _catalog_identity_kwargs(normalized_catalog),
+                "catalog": namespace,
                 "projection": normalized_projection,
                 "table_identifier": table_identifier,
                 "mode": None if mode_identity is None else dict(mode_identity),
@@ -143,7 +139,7 @@ class _IcebergSourceConfig:
         )
         return cls(
             table_identifier=table_identifier,
-            catalog_kwargs=normalized_catalog,
+            catalog_provider=catalog_provider,
             projection=normalized_projection,
             source_identity=(
                 f"iceberg://{table_identifier}?identity={identity_digest}"
@@ -162,7 +158,7 @@ class IcebergSourcePlanner:
         self,
         *,
         table_identifier: str,
-        catalog_kwargs: Mapping[str, Any],
+        catalog_provider: IcebergCatalogProvider,
         projection: Sequence[str],
         row_filter: Any | None = None,
         mode: PinnedSnapshot | ContinuousAppend | None = None,
@@ -181,16 +177,16 @@ class IcebergSourcePlanner:
         mode_identity = _mode_identity(mode)
         config = _IcebergSourceConfig.create(
             table_identifier=table_identifier,
-            catalog_kwargs=catalog_kwargs,
+            catalog_provider=catalog_provider,
             projection=projection,
             mode_identity=mode_identity,
             row_filter=row_filter,
         )
-        self.source_identity = config.source_identity
         self._base_source_identity = config.source_identity
         self.schema_digest = config.schema_digest
-        self._table_identifier = config.table_identifier
-        self._catalog_kwargs = config.catalog_kwargs
+        self._table_session = IcebergTableSession(
+            config.catalog_provider, config.table_identifier
+        )
         self._projection = config.projection
         self._row_filter = row_filter
         self._mode = mode
@@ -209,8 +205,10 @@ class IcebergSourcePlanner:
             raise ValueError("metadata_block_bytes must be positive")
         self._metadata_scan_records = metadata_scan_records
         self._metadata_block_bytes = metadata_block_bytes
-        self._table: Any | None = None
-        self._table_uuid: str | None = None
+
+    @property
+    def source_identity(self) -> str:
+        return self._table_session.source_identity(self._base_source_identity)
 
     @property
     def configuration_identity(self) -> str:
@@ -232,10 +230,7 @@ class IcebergSourcePlanner:
 
     @property
     def table_uuid(self) -> str:
-        self._current_table()
-        if self._table_uuid is None:
-            raise RuntimeError("Iceberg table UUID was not bound")
-        return self._table_uuid
+        return self._table_session.table_uuid
 
     def record_range_for_file(
         self,
@@ -424,32 +419,11 @@ class IcebergSourcePlanner:
             raise ValueError("Iceberg source has no snapshot for scan capture")
         return self._cursor_for_snapshot(table, snapshot, additions_only=False)
 
+    def close(self) -> None:
+        self._table_session.close()
+
     def _current_table(self, *, refresh: bool = False) -> Any:
-        if self._table is None:
-            self._table = load_iceberg_table(
-                self._catalog_kwargs,
-                self._table_identifier,
-            )
-            self._bind_table_identity(self._table)
-        elif self._table_uuid is None:
-            self._bind_table_identity(self._table)
-        if refresh:
-            refreshed = self._table.refresh()
-            self._validate_table_uuid(refreshed)
-            self._table = refreshed
-        if self._table is None:
-            raise TypeError("Iceberg table load or refresh returned None")
-        return self._table
-
-    def _bind_table_identity(self, table: Any) -> None:
-        normalized = require_table_uuid(table)
-        self._table_uuid = normalized
-        self.source_identity = bound_source_identity(
-            self._base_source_identity, normalized
-        )
-
-    def _validate_table_uuid(self, table: Any) -> None:
-        validate_table_uuid(table, self._table_uuid)
+        return self._table_session.table(refresh=refresh)
 
     def _locator(self, path: str, snapshot_id: int) -> IcebergTaskLocator:
         payload = json.dumps(
@@ -478,7 +452,7 @@ class IcebergSourceReader:
         self,
         *,
         table_identifier: str,
-        catalog_kwargs: Mapping[str, Any],
+        catalog_provider: IcebergCatalogProvider,
         projection: Sequence[str],
         format_readers: Mapping[str, Any],
         row_filter: Mapping[str, Any] | None = None,
@@ -494,7 +468,7 @@ class IcebergSourceReader:
             )
         config = _IcebergSourceConfig.create(
             table_identifier=table_identifier,
-            catalog_kwargs=catalog_kwargs,
+            catalog_provider=catalog_provider,
             projection=projection,
             mode_identity=_mode_identity(mode),
             row_filter=row_filter,
@@ -511,22 +485,24 @@ class IcebergSourceReader:
                     f"Iceberg format reader must create a closeable session: {normalized}"
                 )
             normalized_readers[normalized] = reader
-        self.source_identity = config.source_identity
         self._base_source_identity = config.source_identity
         self.schema_digest = config.schema_digest
-        self._table_identifier = config.table_identifier
-        self._catalog_kwargs = config.catalog_kwargs
+        self._table_session = IcebergTableSession(
+            config.catalog_provider, config.table_identifier
+        )
         self._projection = config.projection
         self._mode = mode
         self._format_readers = MappingProxyType(normalized_readers)
         self._format_sessions: dict[str, Any] = {}
         self._closed = False
         self._session_lock = threading.Lock()
-        self._table: Any | None = None
-        self._table_uuid: str | None = None
         self._expected_source_identity: str | None = None
         self._materialization_revision: str | None = None
         self._table_lock = threading.Lock()
+
+    @property
+    def source_identity(self) -> str:
+        return self._table_session.source_identity(self._base_source_identity)
 
     @property
     def configuration_identity(self) -> str:
@@ -539,9 +515,7 @@ class IcebergSourceReader:
     @property
     def table_uuid(self) -> str:
         self._ensure_table_bound()
-        if self._table_uuid is None:
-            raise RuntimeError("Iceberg table UUID was not bound")
-        return self._table_uuid
+        return self._table_session.table_uuid
 
     @property
     def binding_identity(self) -> Mapping[str, str]:
@@ -556,11 +530,9 @@ class IcebergSourceReader:
     @property
     def schema(self) -> pa.Schema:
         self._ensure_table_bound()
-        if self._table is None:
-            raise RuntimeError("Iceberg table was not bound")
         from pyiceberg.io.pyarrow import schema_to_pyarrow
 
-        full_schema = schema_to_pyarrow(self._table.schema())
+        full_schema = schema_to_pyarrow(self._table_session.table().schema())
         if self._projection:
             fields = [full_schema.field(name) for name in self._projection]
             return pa.schema(fields, metadata=full_schema.metadata)
@@ -578,7 +550,7 @@ class IcebergSourceReader:
             and self._expected_source_identity != source_identity
         ):
             raise ValueError("Iceberg reader source identity changed during session")
-        if self._table_uuid is not None and self.source_identity != source_identity:
+        if self._table_session.is_bound and self.source_identity != source_identity:
             raise ValueError("Iceberg reader source identity differs from assignment")
         self._expected_source_identity = source_identity
 
@@ -589,8 +561,10 @@ class IcebergSourceReader:
             self._closed = True
             sessions = tuple(self._format_sessions.values())
             self._format_sessions.clear()
-        for session in sessions:
-            session.close()
+        with ExitStack() as closing:
+            closing.callback(self._table_session.close)
+            for session in sessions:
+                closing.callback(session.close)
 
     def _format_session(self, record_format: str) -> Any:
         with self._session_lock:
@@ -670,45 +644,21 @@ class IcebergSourceReader:
                 "Iceberg record range revision must be a snapshot id"
             ) from exc
         with self._table_lock:
-            if self._table is None:
-                self._table = load_iceberg_table(
-                    self._catalog_kwargs,
-                    self._table_identifier,
-                )
-                self._bind_table_identity(self._table)
-            elif self._materialization_revision != record_range.revision_identity:
-                refreshed = self._table.refresh()
-                self._validate_table_uuid(refreshed)
-                self._table = refreshed
-            if self._table is None:
-                raise TypeError("Iceberg table load or refresh returned None")
-            if self._table.snapshot_by_id(snapshot_id) is None:
+            table = self._table_session.table(
+                refresh=self._materialization_revision != record_range.revision_identity
+            )
+            if table.snapshot_by_id(snapshot_id) is None:
                 raise ValueError(f"Iceberg snapshot does not exist: {snapshot_id}")
             self._materialization_revision = record_range.revision_identity
-            return self._table.io.new_input(record_range.locator.canonical())
+            return table.io.new_input(record_range.locator.canonical())
 
     def _ensure_table_bound(self) -> None:
         with self._table_lock:
-            if self._table is None:
-                self._table = load_iceberg_table(
-                    self._catalog_kwargs,
-                    self._table_identifier,
+            self._table_session.table()
+            if (
+                self._expected_source_identity is not None
+                and self.source_identity != self._expected_source_identity
+            ):
+                raise ValueError(
+                    "Iceberg reader source identity differs from assignment"
                 )
-                self._bind_table_identity(self._table)
-            else:
-                self._validate_table_uuid(self._table)
-
-    def _bind_table_identity(self, table: Any) -> None:
-        normalized = require_table_uuid(table)
-        self._table_uuid = normalized
-        self.source_identity = bound_source_identity(
-            self._base_source_identity, normalized
-        )
-        if (
-            self._expected_source_identity is not None
-            and self.source_identity != self._expected_source_identity
-        ):
-            raise ValueError("Iceberg reader source identity differs from assignment")
-
-    def _validate_table_uuid(self, table: Any) -> None:
-        validate_table_uuid(table, self._table_uuid)

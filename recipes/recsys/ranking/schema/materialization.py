@@ -11,8 +11,10 @@ from flare.runtime.fluxway.transport import (
     transport_row_count,
 )
 from flare.runtime.fluxway.workers.base import require_operator_step
-from flare.runtime.sparse_precision import require_finite_sparse_values
-from flare.runtime.sparse_precision import require_sparse_tensor_dtype
+from flare.runtime.sparse_precision import (
+    require_finite_sparse_values,
+    require_sparse_tensor_dtype,
+)
 from recipes.recsys.ranking.schema.input import materialize_padded_inverse
 
 

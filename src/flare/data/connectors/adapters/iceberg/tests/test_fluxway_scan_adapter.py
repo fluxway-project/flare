@@ -9,21 +9,27 @@ from fluxway.common.ingestion import (
 from fluxway.common.metadata import unpack_metadata
 from pyiceberg.table.snapshots import Operation
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.modes import ContinuousAppend
+from flare.data.connectors.adapters.iceberg.scan import (
+    IcebergSourceScanAdapter,
+    iceberg_scan_lineage_identity,
+)
 from flare.data.connectors.adapters.iceberg.scan_cursor import (
     IcebergScanCursor,
     ManifestEntryOffset,
     ManifestRef,
-)
-from flare.data.connectors.adapters.iceberg.scan import (
-    IcebergSourceScanAdapter,
-    iceberg_scan_lineage_identity,
 )
 from flare.data.connectors.adapters.iceberg.scan_result import (
     FileScanRange,
     FileScanResult,
 )
 from flare.data.connectors.adapters.iceberg.source import IcebergSourcePlanner
+from flare.data.connectors.adapters.iceberg.tests.catalog_fixtures import (
+    MemoryCatalogProvider,
+)
 
 
 def test_continuous_empty_table_has_no_initial_cursor():
@@ -44,20 +50,32 @@ def test_continuous_empty_table_has_no_initial_cursor():
 
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.empty",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: Table(),
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
         mode=ContinuousAppend(),
     )
-    planner._table = Table()
     assert planner.initial_scan_cursor() is None
     assert planner.binding_identity["native_identity"] == "empty-table"
 
     finite = IcebergSourcePlanner(
         table_identifier="catalog.db.empty",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: Table(),
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
     )
-    finite._table = Table()
     with pytest.raises(ValueError, match="no snapshot"):
         finite.initial_scan_cursor()
 
@@ -116,12 +134,18 @@ def test_continuous_empty_binding_discovers_append_snapshots_in_order():
     table = Table()
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.continuous",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: table,
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
         mode=ContinuousAppend(),
         traversal=Traversal(),
     )
-    planner._table = table
     adapter = IcebergSourceScanAdapter(planner)
 
     assert planner.initial_scan_cursor() is None
@@ -231,11 +255,17 @@ def test_iceberg_scan_result_adapter_translates_one_bounded_scan_result() -> Non
 
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.table",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: Table(),
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
         traversal=Traversal(),
     )
-    planner._table = Table()
     initial = planner.initial_scan_cursor()
     adapter = IcebergSourceScanAdapter(planner)
     scan_result = adapter.scan_next(

@@ -7,6 +7,9 @@ import sys
 import pyarrow as pa
 from pyiceberg.catalog.sql import SqlCatalog
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.modes import ContinuousAppend
 from flare.data.connectors.adapters.iceberg.source import IcebergSourcePlanner
 
@@ -69,7 +72,7 @@ def test_consumer_discovers_independent_ray_producers(tmp_path, monkeypatch):
     monkeypatch.chdir(consumer_directory)
     planner = IcebergSourcePlanner(
         table_identifier="test.events",
-        catalog_kwargs=catalog_config,
+        catalog_provider=ConfiguredIcebergCatalogProvider(catalog_config),
         projection=("id",),
         mode=ContinuousAppend(),
     )

@@ -18,11 +18,7 @@ def test_inspector_checks_manifest_control_and_reader_cuts(tmp_path: Path) -> No
     reader_workers = 2
     checkpoint_id = "checkpoint-5"
     source_partitions = [
-        {
-            "record": {
-                "payload": msgpack.packb({"position": step}, use_bin_type=True)
-            }
-        }
+        {"record": {"payload": msgpack.packb({"position": step}, use_bin_type=True)}}
         for _ in range(reader_workers)
     ]
     manifest = {
@@ -38,18 +34,12 @@ def test_inspector_checks_manifest_control_and_reader_cuts(tmp_path: Path) -> No
             "Input": {"runtime_state": {"drain_boundary": {"committed_cut": step}}},
             "Reader": {
                 "source_topology": {"world_size": reader_workers},
-                "runtime_state": {
-                    "drain_boundary": {"committed_cut": step}
-                },
-                "components": {
-                    "source": {"partitions": source_partitions}
-                },
+                "runtime_state": {"drain_boundary": {"committed_cut": step}},
+                "components": {"source": {"partitions": source_partitions}},
             },
         },
     }
-    manifest_path = (
-        tmp_path / "manifests" / checkpoint_id / "manifest.msgpack"
-    )
+    manifest_path = tmp_path / "manifests" / checkpoint_id / "manifest.msgpack"
     _dump(manifest_path, manifest)
     _dump(
         tmp_path / "transactions" / f"{checkpoint_id}.msgpack",

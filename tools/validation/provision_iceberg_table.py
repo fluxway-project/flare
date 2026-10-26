@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import pyarrow as pa
+
 from flare.data.connectors.adapters.iceberg.catalog import (
     build_iceberg_catalog_kwargs,
     load_iceberg_catalog,

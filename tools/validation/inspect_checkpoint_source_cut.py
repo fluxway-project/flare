@@ -16,7 +16,7 @@ import msgpack
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise AssertionError(f"{label} must be a mapping")
+        raise TypeError(f"{label} must be a mapping")
     return value
 
 
@@ -49,9 +49,7 @@ def _load_manifest(root: Path, step: int) -> tuple[str, dict[str, Any]]:
     return checkpoint_id, manifest
 
 
-def inspect(
-    root: Path, step: int, expected_reader_workers: int
-) -> dict[str, Any]:
+def inspect(root: Path, step: int, expected_reader_workers: int) -> dict[str, Any]:
     checkpoint_id, manifest = _load_manifest(root, step)
     cut = _mapping(manifest.get("cut"), "manifest cut")
     if cut.get("position") != step:
@@ -71,17 +69,26 @@ def inspect(
         framework_components.get("source-control"), "source-control"
     )
     if source_control.get("committed_cut") != step:
-        raise AssertionError("source-control committed cut differs from checkpoint step")
+        raise AssertionError(
+            "source-control committed cut differs from checkpoint step"
+        )
 
     spmds = _mapping(manifest.get("spmds"), "manifest spmds")
     bad_spmds = []
     for spmd_id, state in spmds.items():
-        runtime = _mapping(_mapping(state, f"spmd {spmd_id}").get("runtime_state"), f"spmd {spmd_id} runtime_state")
-        drain = _mapping(runtime.get("drain_boundary"), f"spmd {spmd_id} drain_boundary")
+        runtime = _mapping(
+            _mapping(state, f"spmd {spmd_id}").get("runtime_state"),
+            f"spmd {spmd_id} runtime_state",
+        )
+        drain = _mapping(
+            runtime.get("drain_boundary"), f"spmd {spmd_id} drain_boundary"
+        )
         if drain.get("committed_cut") != step:
             bad_spmds.append(spmd_id)
     if bad_spmds:
-        raise AssertionError(f"SPMD committed cuts differ from checkpoint step: {bad_spmds}")
+        raise AssertionError(
+            f"SPMD committed cuts differ from checkpoint step: {bad_spmds}"
+        )
 
     reader = _mapping(spmds.get("Reader"), "Reader SPMD")
     source_topology = _mapping(reader.get("source_topology"), "Reader source_topology")
@@ -102,11 +109,16 @@ def inspect(
         )
     positions: list[int] = []
     for partition in partitions:
-        record = _mapping(_mapping(partition, "Reader partition").get("record"), "Reader partition record")
+        record = _mapping(
+            _mapping(partition, "Reader partition").get("record"),
+            "Reader partition record",
+        )
         payload = record.get("payload")
         if not isinstance(payload, bytes):
-            raise AssertionError("Reader partition checkpoint payload must be bytes")
-        decoded = _mapping(msgpack.unpackb(payload, raw=False), "Reader partition payload")
+            raise TypeError("Reader partition checkpoint payload must be bytes")
+        decoded = _mapping(
+            msgpack.unpackb(payload, raw=False), "Reader partition payload"
+        )
         position = decoded.get("position")
         if not isinstance(position, int) or position != step:
             raise AssertionError(

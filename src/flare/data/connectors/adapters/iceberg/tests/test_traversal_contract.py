@@ -2,6 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.scan_cursor import (
     IcebergScanCursor,
     ManifestEntryOffset,
@@ -14,6 +17,9 @@ from flare.data.connectors.adapters.iceberg.scan_result import (
 from flare.data.connectors.adapters.iceberg.source import (
     IcebergSourcePlanner,
     IcebergSourceReader,
+)
+from flare.data.connectors.adapters.iceberg.tests.catalog_fixtures import (
+    MemoryCatalogProvider,
 )
 
 
@@ -98,11 +104,17 @@ def test_scan_next_forwards_all_bounds_without_snapshot_collection() -> None:
 
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.table",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: Table(),
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
         traversal=Traversal(),
     )
-    planner._table = Table()
     cursor = planner.initial_scan_cursor()
     scan_result = planner.scan_next(
         cursor,
@@ -119,7 +131,9 @@ def test_metadata_budgets_are_strictly_bounded() -> None:
     with pytest.raises(ValueError, match="metadata_scan_records"):
         IcebergSourcePlanner(
             table_identifier="catalog.db.table",
-            catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+            catalog_provider=ConfiguredIcebergCatalogProvider(
+                {"name": "test", "type": "rest", "uri": "http://catalog"}
+            ),
             projection=("id",),
             metadata_scan_records=0,
         )
@@ -155,12 +169,20 @@ def test_planner_rejects_table_uuid_change_before_scan_output() -> None:
         def refresh(self):
             return Table()
 
+    tables = iter((OriginalTable(), Table()))
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.table",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: next(tables),
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
     )
-    planner._table = OriginalTable()
+    _ = planner.binding_identity
     with pytest.raises(ValueError, match="table UUID changed"):
         planner.initial_scan_cursor()
 
@@ -189,14 +211,21 @@ def test_reader_rejects_table_uuid_change_before_file_materialization() -> None:
         def create_session(self, **kwargs):
             raise AssertionError("UUID validation must precede session creation")
 
+    tables = iter((OriginalTable(), ReplacementTable()))
     reader = IcebergSourceReader(
         table_identifier="catalog.db.table",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: next(tables),
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
         format_readers={"parquet": FormatReader()},
     )
-    reader._table = OriginalTable()
-    reader._table_uuid = "original-uuid"
+    _ = reader.binding_identity
     reader._materialization_revision = "1"
     record_range = SimpleNamespace(
         revision_identity="2",

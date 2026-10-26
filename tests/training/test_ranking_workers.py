@@ -7,6 +7,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import numpy as np
 import pytest
 from fluxway import ResourceProfile
+from sparse_embedding.checkpoint.lance_backend import _LanceCheckpointStorage
 
 from flare.jax.training.engines.contracts import TrainStepResult
 from flare.training.components.steppers import GenericLossAdapter
@@ -29,8 +30,6 @@ from recipes.recsys.ranking.metrics.train_metrics import (
 from recipes.recsys.ranking.schema.contracts import (
     build_ranking_batch_schema,
 )
-from sparse_embedding.checkpoint.lance_backend import _LanceCheckpointStorage
-
 from recipes.recsys.ranking.schema.sparse_features import (
     build_sparse_group_feature_widths,
     extract_sparse_base_names,

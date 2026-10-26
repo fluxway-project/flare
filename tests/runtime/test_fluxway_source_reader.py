@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from builtins import ExceptionGroup
 from collections.abc import Iterator, Sequence
-from dataclasses import make_dataclass
+from contextlib import contextmanager
+from dataclasses import make_dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,13 +28,24 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
 )
 
+from flare.data.contracts.assets import AssetRef
+from flare.data.contracts.lineage import LineageConfig, LineageContext
+from flare.data.pipeline.consumption.bootstrap.factory import StandardSourceFactory
 from flare.data.pipeline.consumption.source.contracts.model import (
     FileLocator,
     SourceRecordRange,
 )
-from flare.data.pipeline.consumption.source.contracts.source import SourceReader
+from flare.data.pipeline.consumption.source.contracts.record_range import (
+    RecordRangeReader,
+)
+from flare.data.pipeline.consumption.source.contracts.source import SourceBatch
+from flare.data.pipeline.consumption.source.execution.invocation import (
+    read_source_batch,
+)
+from flare.data.pipeline.consumption.source.execution.record_ranges import (
+    RecordRangeReadSession,
+)
 from flare.runtime.fluxway.source import (
-    AssignedSourceBatchReader,
     WorkItemScheduledDatasetSourceDescriptor,
 )
 from flare.runtime.fluxway.workers.reader import BatchReaderSPMD
@@ -40,10 +54,13 @@ from recipes.recsys.ranking.workers.reader import RecsysReaderSPMD
 
 
 class DescriptorFactory:
+    def prepare_options(self, options):
+        return dict(options)
+
     def create_scan_planner(self, options):
         raise AssertionError("planner must not be called")
 
-    def create_reader(self, options):
+    def create_reader(self, options, *, include_lineage=False):
         raise AssertionError("reader must not be called")
 
 
@@ -158,18 +175,18 @@ async def test_direct_ingestion_rejects_conflicting_activation() -> None:
         await reader.activate_ingestion_layout(conflicting)
 
 
-def test_assigned_reader_requires_feature_layout() -> None:
+def test_standard_reader_requires_projection() -> None:
     descriptor = WorkItemScheduledDatasetSourceDescriptor(
-        source_factory=DescriptorFactory(),
+        source_factory=StandardSourceFactory(),
         global_batch_size=2,
         completion_policy="drop",
     )
 
-    with pytest.raises(ValueError, match="projection"):
+    with pytest.raises(TypeError, match="projection"):
         build_reader_source(
             descriptor=descriptor,
             source_read_concurrency=1,
-            storage_options={},
+            storage_options={"storage_format": "parquet"},
         )
 
 
@@ -195,7 +212,7 @@ def test_assigned_reader_preserves_catalog_token_option() -> None:
     assert source.options["catalog_token"] == "test-token"
 
 
-class DummySourceReader(SourceReader):
+class DummyRangeReader(RecordRangeReader):
     def __init__(self) -> None:
         self.close_calls = 0
         self.read_calls: list[SourceRecordRange] = []
@@ -285,16 +302,19 @@ def _work_item(
 
 @pytest.mark.asyncio
 async def test_assigned_reader_materializes_exact_work_and_closes_once() -> None:
-    source = DummySourceReader()
-    reader = AssignedSourceBatchReader(
+    source = DummyRangeReader()
+    reader = RecordRangeReadSession(
         reader=source,
         projection=("value",),
     )
 
-    result = await reader.read(
-        0,
-        work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
-    )
+    result = (
+        await read_source_batch(
+            reader,
+            0,
+            work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
+        )
+    ).payload
 
     assert isinstance(result, pa.Table)
     assert result["value"].to_pylist() == [12, 13, 14, 15, 16]
@@ -305,18 +325,80 @@ async def test_assigned_reader_materializes_exact_work_and_closes_once() -> None
 
 
 @pytest.mark.asyncio
-async def test_assigned_reader_binds_identity_once_and_rejects_changes() -> None:
-    source = DummySourceReader()
-    reader = AssignedSourceBatchReader(reader=source, projection=("value",))
+async def test_assigned_reader_reuses_range_decode_across_steps(monkeypatch) -> None:
+    import flare.data.pipeline.consumption.source.execution.record_ranges as ranges
 
-    await reader.read(
+    reader = RecordRangeReadSession(reader=DummyRangeReader(), projection=("value",))
+    unpack = ranges.unpack_metadata
+    decoded = []
+
+    def count_decode(token):
+        decoded.append(token)
+        return unpack(token)
+
+    monkeypatch.setattr(ranges, "unpack_metadata", count_decode)
+    try:
+        first = await read_source_batch(
+            reader,
+            0,
+            work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
+        )
+        second = await read_source_batch(
+            reader,
+            1,
+            work_items=(_work_item(step=1, logical_start=17, logical_end=22),),
+        )
+        assert first.payload["value"].to_pylist() == [12, 13, 14, 15, 16]
+        assert second.payload["value"].to_pylist() == [17, 18, 19, 20, 21]
+        assert len(decoded) == 1
+    finally:
+        await reader.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["schema_digest", "revision_identity", "physical_identity"]
+)
+async def test_cached_range_still_rejects_changed_assignment(field) -> None:
+    source = DummyRangeReader()
+    reader = RecordRangeReadSession(reader=source, projection=("value",))
+    work = _work_item(step=0, logical_start=12, logical_end=17)
+    try:
+        await read_source_batch(reader, 0, work_items=(work,))
+        if field == "schema_digest":
+            changed = replace(work.assignment, schema_digest="replacement")
+        else:
+            changed = replace(
+                work.assignment,
+                descriptor=replace(
+                    work.assignment.descriptor, **{field: "replacement"}
+                ),
+            )
+        with pytest.raises(ValueError, match="conflicts with assignment"):
+            await read_source_batch(
+                reader, 0, work_items=(replace(work, assignment=changed),)
+            )
+        assert len(source.read_calls) == 1
+    finally:
+        await reader.close()
+
+
+@pytest.mark.asyncio
+async def test_assigned_reader_binds_identity_once_and_rejects_changes() -> None:
+    source = DummyRangeReader()
+    reader = RecordRangeReadSession(reader=source, projection=("value",))
+
+    batch = await read_source_batch(
+        reader,
         0,
         work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
     )
+    assert batch.payload is not None
     assert source.bound_source_identity == "source"
 
     with pytest.raises(ValueError, match="identity changed"):
-        await reader.read(
+        await read_source_batch(
+            reader,
             1,
             work_items=(
                 _work_item(
@@ -387,11 +469,17 @@ async def test_restored_reader_rejects_replacement_assignment_before_materialize
     None
 ):
     class ReaderFactory:
+        def prepare_options(self, options):
+            return dict(options)
+
         def create_scan_planner(self, options):
             raise AssertionError("planner must not be called")
 
-        def create_reader(self, options):
-            return DummySourceReader()
+        def create_reader(self, options, *, include_lineage=False):
+            return RecordRangeReadSession(
+                reader=DummyRangeReader(),
+                projection=options["projection"],
+            )
 
     descriptor = WorkItemScheduledDatasetSourceDescriptor(
         source_factory=ReaderFactory(),
@@ -439,13 +527,14 @@ async def test_restored_reader_rejects_replacement_assignment_before_materialize
 
 @pytest.mark.asyncio
 async def test_assigned_reader_rejects_step_mismatch() -> None:
-    reader = AssignedSourceBatchReader(
-        reader=DummySourceReader(),
+    reader = RecordRangeReadSession(
+        reader=DummyRangeReader(),
         projection=("value",),
     )
 
-    with pytest.raises(ValueError, match="does not match current step"):
-        await reader.read(
+    with pytest.raises(ValueError, match="does not match the requested step"):
+        await read_source_batch(
+            reader,
             1,
             work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
         )
@@ -453,20 +542,23 @@ async def test_assigned_reader_rejects_step_mismatch() -> None:
 
 @pytest.mark.asyncio
 async def test_assigned_reader_resolves_slice_from_original_file_range() -> None:
-    source = DummySourceReader()
-    reader = AssignedSourceBatchReader(reader=source, projection=("value",))
+    source = DummyRangeReader()
+    reader = RecordRangeReadSession(reader=source, projection=("value",))
 
-    result = await reader.read(
-        0,
-        work_items=(
-            _work_item(
-                step=0,
-                logical_start=14,
-                logical_end=19,
-                descriptor_start=12,
+    result = (
+        await read_source_batch(
+            reader,
+            0,
+            work_items=(
+                _work_item(
+                    step=0,
+                    logical_start=14,
+                    logical_end=19,
+                    descriptor_start=12,
+                ),
             ),
-        ),
-    )
+        )
+    ).payload
 
     assert result["value"].to_pylist() == [14, 15, 16, 17, 18]
     assert source.read_calls[0].record_start == 14
@@ -523,8 +615,8 @@ async def test_assigned_reader_preserves_file_rows_across_planning_windows() -> 
         assignment_policy=AssignmentPolicy.default(),
     )
     windows = _split_units_at_cardinality((unit,), 4)
-    source = DummySourceReader()
-    reader = AssignedSourceBatchReader(reader=source, projection=("value",))
+    source = DummyRangeReader()
+    reader = RecordRangeReadSession(reader=source, projection=("value",))
     planned = []
     actual = []
     try:
@@ -546,7 +638,9 @@ async def test_assigned_reader_preserves_file_rows_across_planning_windows() -> 
                 for item in work_items
                 for row in range(item.logical_start, item.logical_end)
             )
-            batch = await reader.read(step, work_items=work_items)
+            batch = (
+                await read_source_batch(reader, step, work_items=work_items)
+            ).payload
             actual.extend(batch["value"].to_pylist())
         assert planned == list(range(10, 18))
         assert actual == list(range(10, 18))
@@ -610,3 +704,463 @@ def test_ranking_reader_rejects_validity_count_above_global_batch() -> None:
             logical_rank=0,
             logical_world=2,
         )
+
+
+@pytest.mark.asyncio
+async def test_native_query_session_preserves_async_payload_and_opaque_tasks():
+    original = _work_item(step=0, logical_start=12, logical_end=17)
+    unit = replace(
+        original.assignment.descriptor,
+        unit_id="query-partition",
+        locality_key="query-partition",
+        physical_identity="query://partition",
+        opaque_token=b"native-query-token",
+    )
+    assignment = SourceWorkAssignment.create(
+        **{
+            name: getattr(original.assignment, name)
+            for name in (
+                "epoch",
+                "step",
+                "source_identity",
+                "view_identity",
+                "schema_digest",
+                "lineage_digest",
+                "global_start",
+                "global_batch_size",
+                "global_valid_count",
+            )
+        },
+        descriptor=unit,
+    )
+    work = SourceWorkItem(assignment, original.logical_start, original.logical_end)
+    payload = {"value": np.arange(work.cardinality, dtype=np.int32)}
+    loop = asyncio.get_running_loop()
+
+    class NativeSession:
+        closes = 0
+
+        async def read(self, step, *, work_items):
+            assert asyncio.get_running_loop() is loop
+            assert (
+                work_items[0].assignment.descriptor.opaque_token
+                == b"native-query-token"
+            )
+            return SourceBatch(
+                payload, work.cardinality, (AssetRef("query", "dataset", "v1"),)
+            )
+
+        async def close(self):
+            self.closes += 1
+
+    native = NativeSession()
+
+    class NativeFactory:
+        def prepare_options(self, options):
+            assert set(options) == {"native_query"}
+            if not isinstance(options.get("native_query"), str):
+                raise TypeError("native_query must be a string")
+            return dict(options)
+
+        async def create_scan_planner(self, options):
+            raise AssertionError("read execution must not invoke planning")
+
+        async def create_reader(self, options, *, include_lineage=False):
+            assert asyncio.get_running_loop() is loop
+            assert set(options) == {"native_query"}
+            assert options["native_query"] == "select-native"
+            return native
+
+    descriptor = WorkItemScheduledDatasetSourceDescriptor(
+        source_factory=NativeFactory(), global_batch_size=20, completion_policy="drop"
+    )
+    source = build_reader_source(
+        descriptor=descriptor,
+        storage_options={"native_query": "select-native"},
+    )
+
+    class NativeReader(BatchReaderSPMD):
+        def transform_raw_batch(self, value):
+            assert value is payload
+            assert value["value"] is payload["value"]
+            return value
+
+    reader = NativeReader(source=source, output_builder=dict)
+    await reader.activate_ingestion_layout(_activation())
+    reader.ctx = SimpleNamespace(
+        step=0,
+        logical_rank=0,
+        logical_world_size=1,
+        source_work_items=(work,),
+        global_source_offset=0,
+    )
+    result = await reader.read()
+    assert "value" in result
+    await reader.close()
+    assert native.closes == 1
+
+
+@pytest.mark.asyncio
+async def test_source_protocol_rejects_incorrect_native_cardinality():
+    class NativeSession:
+        def read(self, step, *, work_items):
+            return SourceBatch({"native": object()}, 1)
+
+        def close(self):
+            pass
+
+    with pytest.raises(ValueError, match="cardinality"):
+        await read_source_batch(
+            NativeSession(),
+            0,
+            work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.parametrize("audit", [False, True])
+async def test_reader_uses_existing_profiler_and_audit_switches(
+    monkeypatch, tmp_path, profile, audit
+):
+    from fluxway import profiler
+
+    scopes = []
+
+    @contextmanager
+    def scope(name):
+        assert profile, "disabled profiling must not enter scope wrappers"
+        scopes.append(name)
+        yield
+
+    monkeypatch.setattr(profiler, "enabled", lambda: profile)
+    monkeypatch.setattr(profiler, "scope", scope)
+
+    class Factory(DescriptorFactory):
+        def create_reader(self, options, *, include_lineage=False):
+            assert include_lineage is False
+            return RecordRangeReadSession(
+                reader=DummyRangeReader(), projection=("value",)
+            )
+
+    audit_path = tmp_path / "audit.json"
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            descriptor=WorkItemScheduledDatasetSourceDescriptor(
+                source_factory=Factory(), global_batch_size=20, completion_policy="drop"
+            )
+        ),
+        output_builder=dict,
+        execution_audit_path=str(audit_path) if audit else None,
+    )
+    reader.rank = 0
+    reader.ctx = SimpleNamespace(
+        step=0,
+        logical_rank=0,
+        logical_world_size=1,
+        source_work_items=(_work_item(step=0, logical_start=12, logical_end=17),),
+        global_source_offset=0,
+    )
+    await reader.activate_ingestion_layout(_activation())
+    try:
+        result = await reader.read()
+        assert result["value"].flat_values.tolist() == [12, 13, 14, 15, 16]
+    finally:
+        await reader.on_shutdown()
+    assert scopes == (
+        [
+            "sourcework.validate_assignments",
+            "sourcework.materialize_ranges",
+            "reader.to_transport_batch",
+        ]
+        if profile
+        else []
+    )
+    rank_path = tmp_path / "audit_rank_0.json"
+    if audit:
+        import json
+
+        records = json.loads(rank_path.read_text())["records"]
+        assert len(records) == 1
+        assert records[0]["logical_start"] == 12
+        assert records[0]["cardinality"] == 5
+    else:
+        assert not rank_path.exists()
+        assert reader._execution_audit_records is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("synchronous", [False, True])
+async def test_cancelled_activation_keeps_session_creation_owned_until_close(
+    synchronous,
+):
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    async_release = asyncio.Event()
+    sync_release = threading.Event()
+
+    class Session:
+        closes = 0
+
+        def read(self, step, *, work_items):
+            raise AssertionError("creation lifecycle must not read data")
+
+        async def close(self):
+            self.closes += 1
+
+    session = Session()
+
+    async def async_create(options, *, include_lineage=False):
+        assert asyncio.get_running_loop() is loop
+        entered.set()
+        await async_release.wait()
+        return session
+
+    def sync_create(options, *, include_lineage=False):
+        loop.call_soon_threadsafe(entered.set)
+        assert sync_release.wait(timeout=5)
+        return session
+
+    class Factory(DescriptorFactory):
+        create_reader = staticmethod(sync_create if synchronous else async_create)
+
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            descriptor=WorkItemScheduledDatasetSourceDescriptor(
+                source_factory=Factory(), global_batch_size=2, completion_policy="drop"
+            )
+        ),
+        output_builder=dict,
+    )
+    activation = asyncio.create_task(reader.activate_ingestion_layout(_activation()))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        activation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await activation
+        closing = asyncio.create_task(reader.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert session.closes == 0
+    finally:
+        async_release.set()
+        sync_release.set()
+        await reader.close()
+        await asyncio.gather(activation, return_exceptions=True)
+    await closing
+    assert session.closes == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reader_close_keeps_one_cleanup_and_rejects_activation():
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Session:
+        closes = 0
+
+        def read(self, step, *, work_items):
+            raise AssertionError("close lifecycle must not read data")
+
+        async def close(self):
+            self.closes += 1
+            entered.set()
+            await release.wait()
+
+    session = Session()
+
+    class Factory(DescriptorFactory):
+        def create_reader(self, options, *, include_lineage=False):
+            return session
+
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            descriptor=WorkItemScheduledDatasetSourceDescriptor(
+                source_factory=Factory(), global_batch_size=2, completion_policy="drop"
+            )
+        ),
+        output_builder=dict,
+    )
+    await reader.activate_ingestion_layout(_activation())
+    closing = asyncio.create_task(reader.close())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        with pytest.raises(RuntimeError, match="closed"):
+            await reader.activate_ingestion_layout(_activation())
+        waiting = asyncio.create_task(reader.close())
+        await asyncio.sleep(0)
+        assert not waiting.done()
+    finally:
+        release.set()
+        await reader.close()
+    await waiting
+    assert session.closes == 1
+
+
+@pytest.mark.asyncio
+async def test_lazy_lineage_creation_failure_does_not_prevent_source_cleanup():
+    work = _work_item(step=0, logical_start=12, logical_end=17)
+
+    class Session:
+        closes = 0
+
+        def read(self, step, *, work_items):
+            return SourceBatch(
+                {"value": np.arange(work.cardinality)},
+                work.cardinality,
+                (AssetRef("native", "dataset"),),
+            )
+
+        async def close(self):
+            self.closes += 1
+            raise RuntimeError("source cleanup failed")
+
+    session = Session()
+
+    class Factory(DescriptorFactory):
+        def create_reader(self, options, *, include_lineage=False):
+            return session
+
+    class ExporterFactory:
+        calls = 0
+
+        async def create(self, context):
+            self.calls += 1
+            raise ValueError("lineage creation failed")
+
+    exporter_factory = ExporterFactory()
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            descriptor=WorkItemScheduledDatasetSourceDescriptor(
+                source_factory=Factory(),
+                global_batch_size=2,
+                completion_policy="drop",
+                lineage=LineageConfig(
+                    exporter_factory, LineageContext("run", "operation")
+                ),
+            )
+        ),
+        output_builder=dict,
+    )
+    await reader.activate_ingestion_layout(_activation())
+    assert exporter_factory.calls == 0
+    reader.ctx = SimpleNamespace(
+        step=0,
+        logical_rank=0,
+        logical_world_size=1,
+        source_work_items=(work,),
+        global_source_offset=0,
+    )
+    await reader.read()
+    assert exporter_factory.calls == 0
+    with pytest.raises(ExceptionGroup, match="source reader close failed") as raised:
+        await reader.close()
+    assert str(raised.value.exceptions[0]) == "source cleanup failed"
+    assert str(raised.value.exceptions[1].exceptions[0]) == "lineage creation failed"
+    assert exporter_factory.calls == 1
+    assert session.closes == 1
+
+
+def test_default_reader_accepts_native_arrow_batch_without_copying_numeric_values():
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            read_session=LocalSegmentReader(), read_chunk_size=2
+        ),
+        output_builder=dict,
+    )
+    values = pa.array([3, 5, 7], type=pa.int32())
+    raw = pa.record_batch([values], names=["value"])
+    columns = reader.transform_raw_batch(raw)
+    assert (
+        columns["value"].__array_interface__["data"][0] == values.buffers()[1].address
+    )
+
+
+@pytest.mark.parametrize("values", [[True, False], [1, None], ["a", "b"]])
+def test_arrow_table_and_record_batch_use_the_same_consumer_conversion(values):
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            read_session=LocalSegmentReader(), read_chunk_size=2
+        ),
+        output_builder=dict,
+    )
+    batch = pa.record_batch([pa.array(values)], names=["value"])
+    table = pa.Table.from_batches([batch])
+    np.testing.assert_equal(
+        reader.transform_raw_batch(table)["value"],
+        reader.transform_raw_batch(batch)["value"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("synchronous", [False, True])
+async def test_cancelled_read_is_drained_before_releasing_session(synchronous):
+    loop = asyncio.get_running_loop()
+    entered, async_release = asyncio.Event(), asyncio.Event()
+    sync_release = threading.Event()
+    work = _work_item(step=0, logical_start=12, logical_end=17)
+
+    class Session:
+        closes = 0
+        running = False
+
+        async def read_async(self, step, *, work_items):
+            self.running = True
+            entered.set()
+            await async_release.wait()
+            self.running = False
+            return SourceBatch({"value": np.arange(work.cardinality)}, work.cardinality)
+
+        def read_sync(self, step, *, work_items):
+            self.running = True
+            loop.call_soon_threadsafe(entered.set)
+            assert sync_release.wait(timeout=5)
+            self.running = False
+            return SourceBatch({"value": np.arange(work.cardinality)}, work.cardinality)
+
+        read = read_sync if synchronous else read_async
+
+        def close(self):
+            assert not self.running
+            self.closes += 1
+
+    session = Session()
+
+    class Factory(DescriptorFactory):
+        def create_reader(self, options, *, include_lineage=False):
+            return session
+
+    reader = BatchReaderSPMD(
+        source=build_reader_source(
+            descriptor=WorkItemScheduledDatasetSourceDescriptor(
+                source_factory=Factory(), global_batch_size=20, completion_policy="drop"
+            )
+        ),
+        output_builder=dict,
+    )
+    await reader.activate_ingestion_layout(_activation())
+    reader.ctx = SimpleNamespace(
+        step=0,
+        logical_rank=0,
+        logical_world_size=1,
+        source_work_items=(work,),
+        global_source_offset=0,
+    )
+    reading = asyncio.create_task(reader.read())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        closing = asyncio.create_task(reader.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert session.closes == 0
+    finally:
+        async_release.set()
+        sync_release.set()
+        await reader.close()
+    await closing
+    assert session.closes == 1

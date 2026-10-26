@@ -48,13 +48,7 @@ class Model(nnx.Module):
         return {"logits": jnp.sum(inputs["entity_dim_2"], axis=1) @ self.weight}
 
 
-@pytest.mark.parametrize("mode", ["train", "eval"])
-@pytest.mark.parametrize(
-    "label,group", [("outcome", "visitor"), ("feedback", "session")]
-)
-def test_native_graph_assembly_uses_injected_task_and_source(
-    tmp_path, mode, label, group
-):
+def assert_native_graph_assembly(tmp_path, mode, label, group, config_factory):
     descriptors = [
         FeatureDescriptor(
             code=code,
@@ -74,7 +68,7 @@ def test_native_graph_assembly_uses_injected_task_and_source(
         config_digest="0" * 64,
         columns=("fid_1", "fid_2", label),
     ).write_manifest(tmp_path)
-    args = SimpleNamespace(
+    args = config_factory(
         reader_workers=2,
         dp=1,
         sparse_workers="1",
@@ -98,7 +92,6 @@ def test_native_graph_assembly_uses_injected_task_and_source(
         warehouse=None,
         iceberg_config=None,
         iceberg_snapshot_id=None,
-        catalog_token=None,
         table_identifier=None,
         iceberg_max_open_files=None,
         reader_execution_audit_path=None,
@@ -135,13 +128,13 @@ def test_native_graph_assembly_uses_injected_task_and_source(
     )
     definition = NnxModelDefinition.from_initializer(Model)
     execution_plan = TrainingExecutionPlan.replicated()
-    binding_options = dict(
-        sparse_groups=("entity_dim_2",),
-        side_info_groups=("side_info",),
-        resource_profile=common.resources.get_role("compute"),
-        runtime_env={},
-        dp_size=1,
-    )
+    binding_options = {
+        "sparse_groups": ("entity_dim_2",),
+        "side_info_groups": ("side_info",),
+        "resource_profile": common.resources.get_role("compute"),
+        "runtime_env": {},
+        "dp_size": 1,
+    }
     compute = (
         bind_recsys_ranking_training(
             **binding_options, pipeline_depth=2, execution_plan=execution_plan
@@ -157,6 +150,7 @@ def test_native_graph_assembly_uses_injected_task_and_source(
             mb=builder,
             side_info_seq=(),
             args=args,
+            catalog_token=None,
             common=common,
             sparse_workers_config={"entity": 1},
             repeat_first_batch=False,
@@ -233,3 +227,14 @@ def test_native_graph_assembly_uses_injected_task_and_source(
     )
     assert reader_config.group_id_column == group
     assert set(reader_config.feature_layout.projection) == {"fid_1", "fid_2", label}
+    return args
+
+
+@pytest.mark.parametrize("mode", ["train", "eval"])
+@pytest.mark.parametrize(
+    "label,group", [("outcome", "visitor"), ("feedback", "session")]
+)
+def test_native_graph_assembly_uses_injected_task_and_source(
+    tmp_path, mode, label, group
+):
+    assert_native_graph_assembly(tmp_path, mode, label, group, SimpleNamespace)

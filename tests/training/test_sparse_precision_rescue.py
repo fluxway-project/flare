@@ -96,7 +96,9 @@ def test_sparse_native_gradient_cast_is_explicit_and_finite() -> None:
     source = np.asarray([[np.nan, np.inf]], dtype=np.float32)
     with pytest.raises(FloatingPointError, match="sparse_native_gradient"):
         prepare_sparse_native_gradient(
-            source, transport_dtype="float32", native_dtype="float32",
+            source,
+            transport_dtype="float32",
+            native_dtype="float32",
             validate_values=True,
         )
     with pytest.raises(TypeError, match="transport dtype mismatch"):

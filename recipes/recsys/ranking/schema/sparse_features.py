@@ -22,9 +22,7 @@ def parse_sparse_group_name(group_name: str) -> tuple[str, int]:
         )
     base_name, dimension_text = group_name.rsplit("_dim_", 1)
     if not base_name:
-        raise ValueError(
-            f"sparse group base name must not be empty in {group_name!r}"
-        )
+        raise ValueError(f"sparse group base name must not be empty in {group_name!r}")
     try:
         dimension = int(dimension_text)
     except ValueError as error:
@@ -41,9 +39,7 @@ def parse_sparse_group_name(group_name: str) -> tuple[str, int]:
 def extract_sparse_groups_and_dimensions(
     sparse_id_groups: Mapping[str, Sequence[str]] | Sequence[str],
 ) -> tuple[tuple[str, ...], dict[str, list[int]]]:
-    if isinstance(sparse_id_groups, Mapping):
-        names = tuple(sparse_id_groups)
-    elif isinstance(sparse_id_groups, (tuple, list)):
+    if isinstance(sparse_id_groups, (Mapping, tuple, list)):
         names = tuple(sparse_id_groups)
     else:
         raise TypeError(
@@ -57,8 +53,7 @@ def extract_sparse_groups_and_dimensions(
         dimensions_by_base.setdefault(base_name, set()).add(dimension)
 
     sorted_dimensions = {
-        base_name: sorted(dims)
-        for base_name, dims in dimensions_by_base.items()
+        base_name: sorted(dims) for base_name, dims in dimensions_by_base.items()
     }
     return names, sorted_dimensions
 

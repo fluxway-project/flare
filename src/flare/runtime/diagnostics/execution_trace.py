@@ -95,7 +95,7 @@ class _AsyncJsonlWriter:
                 finally:
                     for _ in batch:
                         self._queue.task_done()
-        except BaseException as error:
+        except BaseException as error:  # noqa: BLE001
             self._failure = error
             while True:
                 try:

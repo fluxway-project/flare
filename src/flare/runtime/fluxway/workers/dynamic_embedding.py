@@ -22,12 +22,12 @@ from flare.runtime.fluxway.workers.base import (
 from flare.runtime.sparse_precision import (
     prepare_sparse_native_gradient,
     require_finite_sparse_values,
-    require_sparse_value_dtype,
     require_key_dtype,
     require_sparse_gradient_dtype,
     require_sparse_gradient_transport_dtype,
     require_sparse_key_dtype,
     require_sparse_optimizer_dtype,
+    require_sparse_value_dtype,
 )
 from flare.training.components.sparse_table.contracts import SparseOptimizerConfig
 from flare.training.execution import OptimizerUpdateWindow
@@ -352,6 +352,7 @@ class DynamicSparseEmbeddingSPMD:
                 f"{embeddings.shape}, expected {(keys.size, dim)}"
             )
         return embeddings
+
     async def lookup(self, **unique_ids: TransportTensor) -> Any:
         backend = get_backend()
         step = require_operator_step(
@@ -408,7 +409,9 @@ class DynamicSparseEmbeddingSPMD:
                     embed_tensor, self.value_dtype, boundary="sparse_lookup"
                 )
             if np.dtype(embed_tensor.dtype) != np.dtype(self.value_dtype):
-                raise TypeError("native sparse lookup returned an unexpected value dtype")
+                raise TypeError(
+                    "native sparse lookup returned an unexpected value dtype"
+                )
 
             output_tensor = TransportTensor(
                 flat_values=embed_tensor,
@@ -653,6 +656,7 @@ class DynamicSparseEmbeddingSPMD:
                         embeddings_after=embeddings_after,
                     )
                 observer_gradients.clear()
+
     async def flush_pending_updates(self) -> None:
         if self._steps_since_commit > 0:
             step = (
@@ -674,7 +678,7 @@ class DynamicSparseEmbeddingSPMD:
                         [gradients_by_key[int(key)] for key in keys]
                     )
                     embeddings_after = await self._read_embeddings_for_audit(keys, dim)
-                    getattr(self, "execution_tracer").sparse_commit(
+                    self.execution_tracer.sparse_commit(
                         group=f"{self.gname}_dim_{dim}",
                         step=step,
                         spmd_id=f"Embedding_{self.gname}",
@@ -813,7 +817,7 @@ __all__ = [
     "create_sparse_optimizer",
     "get_sparse_embedding_class",
     "register_sparse_partition_resource",
-    "sparse_partition_resource_strategy",
     "sparse_lookup_async_policy",
+    "sparse_partition_resource_strategy",
     "sparse_update_async_policy",
 ]

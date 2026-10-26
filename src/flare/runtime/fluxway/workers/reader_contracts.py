@@ -4,36 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 from flare.data.schema.virtual_pad import (
-    ArrowVirtualPadBatchFactory,
     VirtualPadBatchFactory,
 )
 from flare.runtime.fluxway.source import WorkItemScheduledDatasetSourceDescriptor
 from fluxway.reader.ingestion_layout import IngestionReadSession
-
-_SOURCE_OPTION_NAMES = frozenset(
-    {
-        "projection",
-        "source_read_concurrency",
-        "dataset_path",
-        "storage_format",
-        "file_storage_options",
-        "catalog_name",
-        "catalog_type",
-        "catalog_uri",
-        "catalog_token",
-        "warehouse",
-        "iceberg_config",
-        "iceberg_snapshot_id",
-        "mode",
-        "table_identifier",
-        "iceberg_max_open_files",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,11 +22,13 @@ class ReaderSource:
     options: Mapping[str, Any]
     read_session: IngestionReadSession | None
     read_chunk_size: int | None
-    pad_batch_factory: VirtualPadBatchFactory = ArrowVirtualPadBatchFactory.create_batch
+    pad_batch_factory: VirtualPadBatchFactory | None = None
 
     def __post_init__(self) -> None:
-        if not callable(self.pad_batch_factory):
+        if self.pad_batch_factory is not None and not callable(self.pad_batch_factory):
             raise TypeError("reader source requires a pad batch factory")
+        if not isinstance(self.options, Mapping):
+            raise TypeError("reader source options must be a mapping")
         assigned = self.descriptor is not None
         direct = self.read_session is not None
         if assigned == direct:
@@ -56,16 +36,6 @@ class ReaderSource:
         if assigned:
             if self.read_chunk_size is not None:
                 raise ValueError("assigned reader source cannot define read_chunk_size")
-            missing = {"projection", "source_read_concurrency"}.difference(self.options)
-            if missing:
-                raise ValueError(
-                    f"assigned reader source is missing options: {sorted(missing)!r}"
-                )
-            unknown = set(self.options).difference(_SOURCE_OPTION_NAMES)
-            if unknown:
-                raise ValueError(
-                    f"assigned reader source has unknown options: {sorted(unknown)!r}"
-                )
         else:
             if self.options:
                 raise ValueError("direct reader source cannot define source options")
@@ -89,30 +59,18 @@ def build_reader_source(
     if (descriptor is None) == (read_session is None):
         raise ValueError("build_reader_source requires exactly one source mode")
     if descriptor is not None:
-        if not projection:
-            raise ValueError("assigned reader source requires a non-empty projection")
-        if source_read_concurrency is None:
-            raise ValueError("assigned reader source requires source_read_concurrency")
-        if not isinstance(storage_options, Mapping):
+        if storage_options is not None and not isinstance(storage_options, Mapping):
             raise TypeError("assigned reader source storage_options must be a mapping")
-        options = dict(storage_options)
-        config_path = options.get("iceberg_config")
-        if config_path is not None:
-            if not isinstance(config_path, (str, Path)):
-                raise TypeError("iceberg_config must be a path")
-            resolved_config_path = Path(config_path).expanduser().resolve(strict=True)
-            if not resolved_config_path.is_file():
-                raise FileNotFoundError(resolved_config_path)
-            options["iceberg_config"] = str(resolved_config_path)
-        options.update(
-            {
-                "projection": tuple(projection),
-                "source_read_concurrency": source_read_concurrency,
-            }
+        options: dict[str, Any] = (
+            {} if storage_options is None else dict(storage_options)
         )
+        if projection:
+            options["projection"] = tuple(projection)
+        if source_read_concurrency is not None:
+            options["source_read_concurrency"] = source_read_concurrency
         return ReaderSource(
             descriptor,
-            MappingProxyType(options),
+            descriptor.source_factory.prepare_options(options),
             None,
             None,
         )

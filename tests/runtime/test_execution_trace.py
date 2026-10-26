@@ -12,12 +12,12 @@ import pytest
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.types.tensor import TransportTensor
 
+from flare.runtime.diagnostics import execution_trace as execution_trace_module
 from flare.runtime.diagnostics.execution_trace import (
     ExecutionTraceOptions,
     JsonlExecutionTracer,
     create_execution_tracer,
 )
-from flare.runtime.diagnostics import execution_trace as execution_trace_module
 from recipes.recsys.ranking.metrics.execution_trace import RecsysExecutionTracer
 
 

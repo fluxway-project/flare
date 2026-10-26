@@ -148,7 +148,10 @@ def require_finite_sparse_values(values: Any, dtype: str, *, boundary: str) -> A
 
 
 def prepare_sparse_native_gradient(
-    values: Any, *, transport_dtype: str, native_dtype: str,
+    values: Any,
+    *,
+    transport_dtype: str,
+    native_dtype: str,
     validate_values: bool = False,
 ) -> Any:
     require_sparse_gradient_transport_dtype(transport_dtype)

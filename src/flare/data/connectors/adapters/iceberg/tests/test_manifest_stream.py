@@ -15,6 +15,9 @@ from pyiceberg.manifest import (
     ManifestFile,
 )
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.manifest_stream import (
     IcebergManifestTraversal,
 )
@@ -23,6 +26,9 @@ from flare.data.connectors.adapters.iceberg.scan_cursor import (
     ManifestListRef,
 )
 from flare.data.connectors.adapters.iceberg.source import IcebergSourcePlanner
+from flare.data.connectors.adapters.iceberg.tests.catalog_fixtures import (
+    MemoryCatalogProvider,
+)
 
 FIXTURE_TABLE_UUID = "fixture-table-uuid"
 
@@ -266,10 +272,16 @@ def test_default_iceberg_planner_uses_bounded_manifest_provider(tmp_path) -> Non
     )
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.table",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: table,
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
     )
-    planner._table = table
     scan_result = _scan_until_data(
         planner.scan_next,
         cursor=planner.initial_scan_cursor(),
@@ -418,10 +430,16 @@ def test_cross_repo_consumption_bookmark_resumes_inside_second_file(
     )
     planner = IcebergSourcePlanner(
         table_identifier="catalog.db.table",
-        catalog_kwargs={"name": "test", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: table,
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "test", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("id",),
     )
-    planner._table = table
     adapter = IcebergSourceScanAdapter(planner)
 
     def next_data(cursor, limit):

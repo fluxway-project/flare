@@ -5,11 +5,18 @@ import pyarrow.parquet as pq
 import pytest
 from pyiceberg.manifest import FileFormat
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.modes import PinnedSnapshot
 from flare.data.connectors.adapters.iceberg.source import (
     IcebergSourcePlanner,
     IcebergSourceReader,
     _normalize_record_format,
+)
+from flare.data.connectors.adapters.iceberg.tests.catalog_fixtures import (
+    MemoryCatalogProvider,
+    catalog_for_loader,
 )
 from flare.data.connectors.adapters.parquet.range_reader import (
     ParquetInputFileReader,
@@ -33,18 +40,26 @@ def test_iceberg_planner_and_reader_share_binding_identity(monkeypatch) -> None:
     )
     planner = IcebergSourcePlanner(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: table,
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "rest", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("fid_101",),
         mode=PinnedSnapshot(7),
     )
-    planner._table = table
     monkeypatch.setattr(
-        "flare.data.connectors.adapters.iceberg.source.load_iceberg_table",
-        lambda *_args, **_kwargs: table,
+        "flare.data.connectors.adapters.iceberg.access.load_iceberg_catalog",
+        lambda *_args, **_kwargs: catalog_for_loader(lambda *_args, **_kwargs: table),
     )
     reader = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
         mode=PinnedSnapshot(7),
@@ -54,7 +69,9 @@ def test_iceberg_planner_and_reader_share_binding_identity(monkeypatch) -> None:
 
     changed = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
     )
@@ -74,23 +91,33 @@ def test_iceberg_reader_validates_assignment_identity_before_output(
     )
     planner = IcebergSourcePlanner(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=MemoryCatalogProvider(
+            lambda _identifier: original_table,
+            identity=(
+                ConfiguredIcebergCatalogProvider(
+                    {"name": "rest", "type": "rest", "uri": "http://catalog"}
+                )
+            ).identity,
+        ),
         projection=("fid_101",),
         mode=PinnedSnapshot(7),
     )
-    planner._table = original_table
     expected_source_identity = planner.binding_identity["source_identity"]
     replacement_table = SimpleNamespace(
         metadata=SimpleNamespace(table_uuid="replacement-uuid"),
         io=SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "flare.data.connectors.adapters.iceberg.source.load_iceberg_table",
-        lambda *_args, **_kwargs: replacement_table,
+        "flare.data.connectors.adapters.iceberg.access.load_iceberg_catalog",
+        lambda *_args, **_kwargs: catalog_for_loader(
+            lambda *_args, **_kwargs: replacement_table
+        ),
     )
     reader = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
         mode=PinnedSnapshot(7),
@@ -112,16 +139,20 @@ def test_iceberg_adapter_normalizes_declared_file_format() -> None:
 def test_iceberg_checkpoint_identity_hashes_catalog_and_projection() -> None:
     original = IcebergSourcePlanner(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog-a"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog-a"}
+        ),
         projection=("fid_1",),
     )
     changed = IcebergSourcePlanner(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog-b"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog-b"}
+        ),
         projection=("fid_2",),
     )
-    assert original.source_identity != changed.source_identity
-    assert "http://catalog-a" not in original.source_identity
+    assert original.configuration_identity != changed.configuration_identity
+    assert "http://catalog-a" not in original.configuration_identity
     assert original.schema_digest != changed.schema_digest
 
 
@@ -134,23 +165,27 @@ def test_iceberg_checkpoint_identity_excludes_catalog_credentials() -> None:
     }
     original = IcebergSourcePlanner(
         table_identifier="ns.table",
-        catalog_kwargs=common,
+        catalog_provider=ConfiguredIcebergCatalogProvider(common),
         projection=("fid_1",),
     )
     rotated = IcebergSourcePlanner(
         table_identifier="ns.table",
-        catalog_kwargs={**common, "token": "token-b"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {**common, "token": "token-b"}
+        ),
         projection=("fid_1",),
     )
-    assert original.source_identity == rotated.source_identity
-    assert "token-a" not in original.source_identity
+    assert original.configuration_identity == rotated.configuration_identity
+    assert "token-a" not in original.configuration_identity
 
 
 def test_iceberg_adapter_rejects_logical_names_as_physical_projection() -> None:
     with pytest.raises(ValueError, match="identifier naming rules"):
         IcebergSourcePlanner(
             table_identifier="ns.table",
-            catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+            catalog_provider=ConfiguredIcebergCatalogProvider(
+                {"name": "rest", "type": "rest", "uri": "http://catalog"}
+            ),
             projection=("con_city-expect_city_fid",),
         )
 
@@ -183,12 +218,14 @@ def test_iceberg_adapter_reads_with_catalog_vended_file_io(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(
-        "flare.data.connectors.adapters.iceberg.source.load_iceberg_table",
-        lambda *_args, **_kwargs: table,
+        "flare.data.connectors.adapters.iceberg.access.load_iceberg_catalog",
+        lambda *_args, **_kwargs: catalog_for_loader(lambda *_args, **_kwargs: table),
     )
     reader = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
     )
@@ -237,12 +274,14 @@ def test_iceberg_reader_reuses_one_vended_input_per_snapshot_file(monkeypatch) -
         ),
     )
     monkeypatch.setattr(
-        "flare.data.connectors.adapters.iceberg.source.load_iceberg_table",
-        lambda *_args, **_kwargs: table,
+        "flare.data.connectors.adapters.iceberg.access.load_iceberg_catalog",
+        lambda *_args, **_kwargs: catalog_for_loader(lambda *_args, **_kwargs: table),
     )
     reader = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
     )
@@ -298,12 +337,14 @@ def test_iceberg_reader_does_not_reuse_file_between_snapshots(monkeypatch) -> No
         snapshot_by_id=snapshots.get,
     )
     monkeypatch.setattr(
-        "flare.data.connectors.adapters.iceberg.source.load_iceberg_table",
-        lambda *_args, **_kwargs: table,
+        "flare.data.connectors.adapters.iceberg.access.load_iceberg_catalog",
+        lambda *_args, **_kwargs: catalog_for_loader(lambda *_args, **_kwargs: table),
     )
     reader = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
     )
@@ -327,18 +368,21 @@ def test_iceberg_reader_does_not_reuse_file_between_snapshots(monkeypatch) -> No
 
 
 def test_iceberg_reader_rejects_reads_after_close(monkeypatch) -> None:
-    table = SimpleNamespace(io=object())
+    table = SimpleNamespace(
+        io=object(), metadata=SimpleNamespace(table_uuid="test-uuid")
+    )
     monkeypatch.setattr(
-        "flare.data.connectors.adapters.iceberg.source.load_iceberg_table",
-        lambda *_args, **_kwargs: table,
+        "flare.data.connectors.adapters.iceberg.access.load_iceberg_catalog",
+        lambda *_args, **_kwargs: catalog_for_loader(lambda *_args, **_kwargs: table),
     )
     reader = IcebergSourceReader(
         table_identifier="ns.table",
-        catalog_kwargs={"name": "rest", "type": "rest", "uri": "http://catalog"},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {"name": "rest", "type": "rest", "uri": "http://catalog"}
+        ),
         projection=("fid_101",),
         format_readers=FORMAT_READERS,
     )
-    reader.close()
     record_range = SourceRecordRange(
         reader.source_identity,
         "7",
@@ -348,5 +392,6 @@ def test_iceberg_reader_rejects_reads_after_close(monkeypatch) -> None:
         reader.schema_digest,
         "parquet",
     )
+    reader.close()
     with pytest.raises(RuntimeError, match="reader is closed"):
         reader.read_batches(record_range, ("fid_101",), batch_size=1)

@@ -5,8 +5,6 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
-from flare.data.connectors.adapters.file.source import FileListSourceAdapter
-from flare.data.pipeline.consumption.source.contracts.model import SourceRecordRange
 from fluxway.common.ingestion import (
     OpaqueSourceCursor,
     SourceScanBudget,
@@ -15,6 +13,9 @@ from fluxway.common.ingestion import (
 )
 from fluxway.common.metadata import metadata_digest, pack_metadata
 from fluxway.control_plane.ingestion import LayoutUnitDescriptor
+
+from flare.data.connectors.adapters.file.source import FileListSourceAdapter
+from flare.data.pipeline.consumption.source.contracts.model import SourceRecordRange
 
 
 class FileListSourceScanAdapter:
@@ -31,6 +32,9 @@ class FileListSourceScanAdapter:
                 "source_identity": source.source_identity,
             }
         )
+
+    def close(self) -> None:
+        self._source.close()
 
     @property
     def binding_identity(self) -> Mapping[str, str]:
@@ -128,7 +132,7 @@ class FileListSourceScanAdapter:
             cardinality_metric="rows",
             split_policy="SplittableSpan",
             locality_key=record_range.locator.canonical(),
-            physical_identity=record_range.locator.canonical(),
+            storage_locator=record_range.locator.canonical(),
             logical_start=record_range.record_start,
             opaque_token=pack_metadata(record_range.to_dict()),
         )

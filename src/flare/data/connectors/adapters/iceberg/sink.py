@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 import ray
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.catalog import (
     load_iceberg_table,
     normalize_iceberg_catalog_kwargs,
@@ -26,6 +29,7 @@ from flare.data.connectors.adapters.iceberg.table import (
     validate_iceberg_table,
     validate_iceberg_table_properties,
 )
+from flare.data.contracts.assets import AssetRef
 from flare.data.contracts.sink import PublicationIdentity, SinkResult
 from flare.data.pipeline.production.publication.contract import (
     PUBLICATION_ID_PROPERTY,
@@ -97,6 +101,9 @@ class IcebergSnapshotPublisher:
             merged_catalog_kwargs.update(get_pyiceberg_s3_kwargs(storage_options))
 
         self._catalog_kwargs = normalize_iceberg_catalog_kwargs(merged_catalog_kwargs)
+        self._asset_namespace = ConfiguredIcebergCatalogProvider(
+            self._catalog_kwargs
+        ).identity
         self._snapshot_properties = dict(snapshot_properties or {})
         if PUBLICATION_ID_PROPERTY in self._snapshot_properties:
             raise ValueError(
@@ -167,7 +174,16 @@ class IcebergSnapshotPublisher:
             write_seconds=time.perf_counter() - write_started,
         )
         self._log_commit_observation(observation)
-        return SinkResult(total_rows=observation.added_records)
+        return SinkResult(
+            total_rows=observation.added_records,
+            outputs=(
+                AssetRef(
+                    self._asset_namespace,
+                    self._table_identifier,
+                    str(observation.snapshot_id),
+                ),
+            ),
+        )
 
     def _log_commit_observation(self, observation: IcebergCommitObservation) -> None:
         layout = observation.file_layout

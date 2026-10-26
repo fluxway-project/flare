@@ -15,6 +15,9 @@ from pyiceberg.schema import Schema
 from pyiceberg.types import LongType, NestedField, StringType
 
 from flare.config.iceberg import IcebergSettings
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.catalog import (
     build_iceberg_catalog_kwargs,
 )
@@ -99,7 +102,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         planner = IcebergSourcePlanner(
             table_identifier=identifier,
-            catalog_kwargs=settings.to_pyiceberg_kwargs(),
+            catalog_provider=ConfiguredIcebergCatalogProvider(
+                settings.to_pyiceberg_kwargs()
+            ),
             projection=_PROJECTION,
             mode=PinnedSnapshot(first_snapshot),
         )
@@ -109,7 +114,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         files = _scan_files(planner, cursor)
         reader = IcebergSourceReader(
             table_identifier=identifier,
-            catalog_kwargs=settings.to_pyiceberg_kwargs(),
+            catalog_provider=ConfiguredIcebergCatalogProvider(
+                settings.to_pyiceberg_kwargs()
+            ),
             projection=_PROJECTION,
             format_readers={"parquet": ParquetInputFileReader(max_open_files=2)},
             mode=PinnedSnapshot(first_snapshot),

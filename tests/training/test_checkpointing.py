@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-
 from typing import Any
 
 import jax.numpy as jnp
@@ -304,6 +303,7 @@ def test_sparse_embedding_default_path_skips_trace_readback_and_validation(
 ) -> None:
     from fluxway.common.tensor_backend import prepare_dlpack_input
     from fluxway.common.types.tensor import TransportTensor
+
     from flare.runtime.fluxway.workers import dynamic_embedding
     from flare.runtime.sparse_precision import (
         prepare_sparse_native_gradient as prepare_gradient,
@@ -314,11 +314,15 @@ def test_sparse_embedding_default_path_skips_trace_readback_and_validation(
             self.accumulated: list[tuple[np.ndarray, Any]] = []
             self.step_count = 0
 
-        async def async_lookup_or_insert(self, capsule: Any, dim: int) -> tuple[Any, None]:
+        async def async_lookup_or_insert(
+            self, capsule: Any, dim: int
+        ) -> tuple[Any, None]:
             arr = np.zeros((2, dim), dtype=np.float32)
             return prepare_dlpack_input(arr), None
 
-        async def async_accumulate_gradients(self, keys: np.ndarray, grad_data: Any) -> None:
+        async def async_accumulate_gradients(
+            self, keys: np.ndarray, grad_data: Any
+        ) -> None:
             self.accumulated.append((keys, grad_data))
 
         async def async_optimizer_step(self, norm_steps: int) -> None:
@@ -383,7 +387,9 @@ def test_sparse_embedding_default_path_skips_trace_readback_and_validation(
     lookup_res = asyncio.run(owner.lookup(unique_ids_dim4=tensor))
     assert hasattr(lookup_res, "sparse_features_test_dim_4")
 
-    grad_vals = np.asarray([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=np.float32)
+    grad_vals = np.asarray(
+        [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=np.float32
+    )
     grad_tensor = TransportTensor(flat_values=grad_vals, source_step=0)
     window = OptimizerUpdateWindow(
         micro_step=1,

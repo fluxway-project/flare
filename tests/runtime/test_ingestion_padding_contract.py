@@ -4,8 +4,8 @@ from dataclasses import make_dataclass, replace
 from functools import partial
 from types import SimpleNamespace
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -31,14 +31,19 @@ from flare.data.pipeline.consumption.source.contracts.model import (
     FileLocator,
     SourceRecordRange,
 )
-from flare.runtime.fluxway.source import AssignedSourceBatchReader
-from flare.runtime.fluxway.source import WorkItemScheduledDatasetSourceDescriptor
-from flare.runtime.fluxway.workers.reader_contracts import build_reader_source
+from flare.data.pipeline.consumption.source.execution.invocation import (
+    read_source_batch,
+)
+from flare.data.pipeline.consumption.source.execution.record_ranges import (
+    RecordRangeReadSession,
+)
 from flare.data.schema.feature_catalog import FeatureOutputKind
 from flare.data.schema.feature_layout import TrainingFeatureLayout
 from flare.data.schema.transform import table_to_training_dict
-from recipes.recsys.ranking.workers.reader import RankingReaderConfig, RecsysReaderSPMD
+from flare.runtime.fluxway.source import WorkItemScheduledDatasetSourceDescriptor
+from flare.runtime.fluxway.workers.reader_contracts import build_reader_source
 from recipes.recsys.ranking.graph.losses import RankingLossAdapter
+from recipes.recsys.ranking.workers.reader import RankingReaderConfig, RecsysReaderSPMD
 
 
 class ReadCountingParquetSource(ParquetSourceAdapter):
@@ -52,14 +57,21 @@ class ReadCountingParquetSource(ParquetSourceAdapter):
 
 
 class SingleReaderFactory:
+    def prepare_options(self, options):
+        return dict(options)
+
     def __init__(self, reader):
         self.reader = reader
 
     def create_scan_planner(self, options):
         raise AssertionError("worker materialization must not invoke a planner")
 
-    def create_reader(self, options):
-        return self.reader
+    def create_reader(self, options, *, include_lineage=False):
+        return RecordRangeReadSession(
+            reader=self.reader,
+            projection=options["projection"],
+            pad_batch_factory=options["pad_batch_factory"],
+        )
 
 
 def compile_tail(record_range=None, *, step=1, batch_size=8):
@@ -197,9 +209,9 @@ async def test_pure_padding_preserves_real_parquet_schema_without_data_reads(tmp
     physical = ReadCountingParquetSource(files=(str(path),), projection=("feature",))
     compiled = compile_tail(physical.record_ranges()[0])
     padding = tuple(item for item in work_items(compiled) if item.is_synthetic_padding)
-    session = AssignedSourceBatchReader(reader=physical, projection=("feature",))
+    session = RecordRangeReadSession(reader=physical, projection=("feature",))
     try:
-        table = await session.read(1, work_items=padding)
+        table = (await read_source_batch(session, 1, work_items=padding)).payload
         assert table.schema.remove_metadata() == schema
         assert table["feature"].to_pylist() == [None] * 3
         assert table.schema.metadata[b"samples_valid_count"] == b"5"
@@ -208,32 +220,22 @@ async def test_pure_padding_preserves_real_parquet_schema_without_data_reads(tmp
         await session.close()
 
 
-@pytest.mark.asyncio
-async def test_pure_padding_cannot_guess_schema_or_probe_data(tmp_path):
+def test_source_reader_without_schema_is_rejected_before_data_reads(tmp_path):
     path = tmp_path / "part.parquet"
     pq.write_table(pa.table({"value": range(5)}), path)
     physical = ReadCountingParquetSource(files=(str(path),), projection=("value",))
-    compiled = compile_tail(physical.record_ranges()[0])
     reader_without_schema = SimpleNamespace(
         bind_source_identity=physical.bind_source_identity,
         read=physical.read,
         read_batches=physical.read_batches,
         close=physical.close,
     )
-    session = AssignedSourceBatchReader(
-        reader=reader_without_schema, projection=("value",)
-    )
     try:
-        with pytest.raises(ValueError, match="explicit Arrow schema"):
-            await session.read(
-                1,
-                work_items=tuple(
-                    item for item in work_items(compiled) if item.is_synthetic_padding
-                ),
-            )
+        with pytest.raises(TypeError, match="requires RecordRangeReader"):
+            RecordRangeReadSession(reader=reader_without_schema, projection=("value",))
         assert physical.data_reads == 0
     finally:
-        await session.close()
+        physical.close()
 
 
 @pytest.mark.asyncio
@@ -395,15 +397,17 @@ async def test_pure_padding_still_binds_source_identity(tmp_path):
     physical = ParquetSourceAdapter(files=(str(path),), projection=("value",))
     compiled = compile_tail(physical.record_ranges()[0])
     padding = tuple(item for item in work_items(compiled) if item.is_synthetic_padding)
-    session = AssignedSourceBatchReader(reader=physical, projection=("value",))
+    session = RecordRangeReadSession(reader=physical, projection=("value",))
     try:
-        await session.read(1, work_items=padding)
+        batch = await read_source_batch(session, 1, work_items=padding)
+        assert batch.payload is not None
         assert session.bound_source_identity == physical.source_identity
         changed = compile_tail(
             replace(physical.record_ranges()[0], source_identity="replacement"), step=2
         )
         with pytest.raises(ValueError, match="identity changed"):
-            await session.read(
+            await read_source_batch(
+                session,
                 2,
                 work_items=tuple(
                     item for item in work_items(changed) if item.is_synthetic_padding

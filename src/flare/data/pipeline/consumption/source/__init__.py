@@ -14,8 +14,9 @@ from flare.data.pipeline.consumption.source.batching.stream_reader import (
 )
 from flare.data.pipeline.consumption.source.contracts import (
     ControlledSourceScanAdapter,
+    SourceBatch,
     SourceFactory,
-    SourceReader,
+    SourceReadSession,
     SourceRecordRange,
 )
 from flare.data.pipeline.consumption.source.placement import (
@@ -28,12 +29,13 @@ __all__ = [
     "BatchCompletionPolicy",
     "BatchValidity",
     "CarryUntilComplete",
+    "ControlledSourceScanAdapter",
     "DropIncompleteAtEnd",
     "PadWithValidity",
     "RequireComplete",
+    "SourceBatch",
     "SourceFactory",
-    "SourceReader",
-    "ControlledSourceScanAdapter",
+    "SourceReadSession",
     "SourceRecordRange",
     "StreamingBatchReader",
     "bind_partitions",
