@@ -8,6 +8,9 @@ import pytest
 import tyro
 
 import flare.data.pipeline.production.publish.runner as publish_runner
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.parquet.sink import ParquetDatasetPublisher
 from flare.data.pipeline.production.publish.runner import (
     _build_output_publisher,
@@ -62,8 +65,7 @@ def test_local_parquet_output_is_explicit_and_self_describing(tmp_path) -> None:
 
     publisher = _build_output_publisher(
         args,
-        catalog_kwargs={},
-        storage_options={},
+        catalog_provider=None,
         pipeline=_Pipeline(),
     )
 
@@ -104,8 +106,13 @@ def test_iceberg_layout_observation_is_forwarded_to_publisher(
 
     publisher = publish_runner._build_output_publisher(
         args,
-        catalog_kwargs={"type": "memory"},
-        storage_options={},
+        catalog_provider=ConfiguredIcebergCatalogProvider(
+            {
+                "name": "memory",
+                "type": "in-memory",
+                "warehouse": str(tmp_path / "warehouse"),
+            }
+        ),
         pipeline=_Pipeline(),
     )
 

@@ -24,6 +24,7 @@ import threading
 import time
 import typing
 from collections.abc import Sequence
+from contextlib import nullcontext
 from functools import partial
 
 import pyarrow as pa
@@ -43,6 +44,7 @@ from flare.data.pipeline.production.publish.read_profile import (
     ReadProfile,
     report_read_profile,
 )
+from flare.data.pipeline.production.publish.source import PartitionedSourceProvider
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,7 @@ class HdfsZstdDatasource(Datasource):
         source_files_per_task: int,
         read_profile: bool = False,
         read_profile_collector: typing.Any | None = None,
+        source_provider: PartitionedSourceProvider | None = None,
     ):
         self._file_paths = tuple(file_paths)
         if source_csv_block_size_bytes <= 0:
@@ -117,6 +120,7 @@ class HdfsZstdDatasource(Datasource):
         self._source_files_per_task = source_files_per_task
         self._read_profile = read_profile
         self._read_profile_collector = read_profile_collector
+        self._source_provider = source_provider
 
     def get_read_tasks(
         self,
@@ -148,20 +152,28 @@ class HdfsZstdDatasource(Datasource):
                 prefetch_buffer_size=self._datasource_prefetch_buffer_size_bytes,
                 read_profile=self._read_profile,
                 read_profile_collector=self._read_profile_collector,
+                source_provider=self._source_provider,
             ):
-                factory = partial(
-                    default_prefetch_reader_factory,
-                    buffer_size=prefetch_buffer_size,
-                    max_buffers=p_max,
+                context = (
+                    source_provider.open()
+                    if source_provider is not None
+                    else nullcontext(None)
                 )
-                for path in shard_paths:
-                    yield from _read_decompress_file(
-                        path,
-                        source_csv_block_size_bytes,
-                        reader_factory=factory,
-                        read_profile=read_profile,
-                        read_profile_collector=read_profile_collector,
+                with context as source:
+                    factory = partial(
+                        default_prefetch_reader_factory,
+                        buffer_size=prefetch_buffer_size,
+                        max_buffers=p_max,
+                        **({"source": source} if source is not None else {}),
                     )
+                    for path in shard_paths:
+                        yield from _read_decompress_file(
+                            path,
+                            source_csv_block_size_bytes,
+                            reader_factory=factory,
+                            read_profile=read_profile,
+                            read_profile_collector=read_profile_collector,
+                        )
 
             tasks.append(ReadTask(read_fn, metadata))
         return tasks
@@ -341,13 +353,18 @@ def default_prefetch_reader_factory(
     buffer_size: int,
     max_buffers: int,
     profile: ReadProfile | None = None,
+    source=None,
 ) -> io.RawIOBase:
-    reader = ResilientWebHdfsReader(
-        hdfs_path,
-        url_resolver=_url_resolver,
-        max_retries=5,
-        connect_timeout=_CONNECT_TIMEOUT_S,
-        read_timeout=_READ_TIMEOUT_S,
+    reader = (
+        source.open(hdfs_path)
+        if source is not None
+        else ResilientWebHdfsReader(
+            hdfs_path,
+            url_resolver=_url_resolver,
+            max_retries=5,
+            connect_timeout=_CONNECT_TIMEOUT_S,
+            read_timeout=_READ_TIMEOUT_S,
+        )
     )
     if profile is None:
         return PrefetchReader(reader, max_buffers=max_buffers, buffer_size=buffer_size)

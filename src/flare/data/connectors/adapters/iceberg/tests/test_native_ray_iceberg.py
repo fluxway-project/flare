@@ -240,7 +240,7 @@ def test_native_ray_consumption_bookmark_replans_with_fresh_source(
                 interval["record_start"],
                 interval["record_start"] + interval["record_count"],
             ):
-                yield unit.physical_identity, row
+                yield unit.storage_locator, row
 
     planner, adapter = new_source()
     cursor = OpaqueSourceCursor.from_payload(planner.initial_scan_cursor().encode())

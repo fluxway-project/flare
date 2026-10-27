@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -62,6 +63,7 @@ def test_fixed_schema_append_commits_validated_append_without_schema_update() ->
     expected_iceberg_schema = object()
     datasink._expected_schema = schema
     datasink._expected_iceberg_schema = expected_iceberg_schema
+    datasink._table_scope = lambda: nullcontext()
     datasink._table = table
     datasink._mode = SaveMode.APPEND
     table.schema.return_value = expected_iceberg_schema
@@ -85,6 +87,7 @@ def test_fixed_schema_append_rejects_table_schema_mismatch() -> None:
     datasink = object.__new__(FixedSchemaAppendIcebergDatasink)
     datasink._expected_schema = expected_schema
     datasink._expected_iceberg_schema = object()
+    datasink._table_scope = lambda: nullcontext()
     datasink._table = MagicMock()
     datasink._mode = SaveMode.APPEND
     datasink._table.schema.return_value = object()
@@ -106,5 +109,6 @@ def test_fixed_schema_append_rejects_non_append_mode() -> None:
             expected_schema=schema,
             expected_iceberg_schema=object(),
             table_identifier="db.tbl",
+            catalog_provider=MagicMock(),
             mode=SaveMode.OVERWRITE,
         )

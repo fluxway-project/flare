@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import time
+from contextlib import closing
 from dataclasses import dataclass, replace
 from typing import Any
 
-from flare.data.connectors.adapters.iceberg.catalog import load_iceberg_table
+from flare.data.connectors.adapters.iceberg.access import (
+    IcebergCatalogProvider,
+    IcebergTableSession,
+)
 from flare.data.pipeline.production.publication.contract import (
     PUBLICATION_ID_PROPERTY,
     validate_publication_id,
@@ -67,7 +71,7 @@ class IcebergCommitObservation:
 
 def observe_committed_publication(
     *,
-    catalog_kwargs: dict[str, Any],
+    catalog_provider: IcebergCatalogProvider,
     table_identifier: str,
     expected_publication_id: str,
     write_seconds: float,
@@ -75,14 +79,14 @@ def observe_committed_publication(
 ) -> IcebergCommitObservation:
     """Read and fence one committed publication without mutating Iceberg state."""
     started = time.perf_counter()
-    table = load_iceberg_table(catalog_kwargs, table_identifier)
-    observation = _observe_committed_snapshot(
-        table,
-        expected_publication_id=expected_publication_id,
-        write_seconds=write_seconds,
-        include_file_layout=include_file_layout,
-        snapshot_observation_seconds=0.0,
-    )
+    with closing(IcebergTableSession(catalog_provider, table_identifier)) as session:
+        observation = _observe_committed_snapshot(
+            session.table(),
+            expected_publication_id=expected_publication_id,
+            write_seconds=write_seconds,
+            include_file_layout=include_file_layout,
+            snapshot_observation_seconds=0.0,
+        )
     return replace(
         observation,
         snapshot_observation_seconds=time.perf_counter() - started,
@@ -123,6 +127,8 @@ def _observe_committed_snapshot(
     added_records = summary_get("added-records")
     if added_records is None:
         raise ValueError("Iceberg snapshot summary missing 'added-records' after write")
+    if isinstance(added_records, bool) or not isinstance(added_records, (str, int)):
+        raise TypeError("Iceberg added-records must be an integer or integer string")
     added_records = int(added_records)
     if added_records < 0:
         raise ValueError("Iceberg snapshot added-records must not be negative")

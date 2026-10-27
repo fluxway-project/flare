@@ -7,7 +7,10 @@ from unittest.mock import patch
 
 from flare.data.contracts.sink import SinkResult
 from flare.data.pipeline.production.publication.contract import PublicationProtocol
-from flare.data.pipeline.production.publish.runner import _run_hdfs_mode
+from flare.data.pipeline.production.publish.runner import (
+    discover_publication_manifest,
+    publish_manifest,
+)
 
 
 @dataclass
@@ -82,8 +85,12 @@ def test_finite_hdfs_execution_uses_deterministic_windows_and_leases() -> None:
         "flare.data.pipeline.production.publish.runner.iter_hdfs_file_paths",
         return_value=iter(paths),
     ):
-        _run_hdfs_mode(
-            _args(),
+        args = _args()
+        args.input = None
+        manifest = discover_publication_manifest(args, state)
+        publish_manifest(
+            manifest,
+            args,
             state,
             pipeline,
             output,

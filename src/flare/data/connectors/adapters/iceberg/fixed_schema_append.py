@@ -7,11 +7,17 @@ protocol, snapshot properties, and result validation belong to ``sink.py``.
 from __future__ import annotations
 
 import logging
+from contextlib import closing, contextmanager
 from typing import Any
 
 import pyarrow as pa
 from ray.data import SaveMode
 from ray.data._internal.datasource.iceberg_datasink import IcebergDatasink
+
+from flare.data.connectors.adapters.iceberg.access import (
+    IcebergCatalogProvider,
+    IcebergTableSession,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,7 @@ class FixedSchemaAppendIcebergDatasink(IcebergDatasink):
         *,
         expected_schema: pa.Schema,
         expected_iceberg_schema: Any,
+        catalog_provider: IcebergCatalogProvider,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -67,8 +74,48 @@ class FixedSchemaAppendIcebergDatasink(IcebergDatasink):
             )
         self._expected_schema = expected_schema
         self._expected_iceberg_schema = expected_iceberg_schema
+        self._catalog_provider = catalog_provider
+
+    def __getstate__(self) -> dict:
+        state = super().__getstate__()
+        state["_io"] = None
+        state["_table_metadata"] = None
+        return state
+
+    @contextmanager
+    def _table_scope(self):
+        with closing(
+            IcebergTableSession(self._catalog_provider, self.table_identifier)
+        ) as session:
+            self._table = session.table()
+            self._io = self._table.io
+            self._table_metadata = self._table.metadata
+            try:
+                if self._table.schema() != self._expected_iceberg_schema:
+                    raise RuntimeError(
+                        "Iceberg table schema differs from the validated Iceberg schema"
+                    )
+                yield
+            finally:
+                del self._table
+                del self._io
+                del self._table_metadata
+
+    def on_write_start(self, schema: pa.Schema | None = None) -> None:
+        if schema is not None:
+            require_fixed_output_schemas([schema], self._expected_schema)
+        with self._table_scope():
+            pass
+
+    def write(self, blocks, ctx):
+        with self._table_scope():
+            return super().write(blocks, ctx)
 
     def on_write_complete(self, write_result: Any) -> None:
+        with self._table_scope():
+            self._commit_validated_append(write_result)
+
+    def _commit_validated_append(self, write_result: Any) -> None:
         import time
 
         started = time.perf_counter()

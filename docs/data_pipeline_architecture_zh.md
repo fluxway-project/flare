@@ -1,5 +1,7 @@
 # 数据流水线架构
 
+[English](data_pipeline_architecture.md)
+
 本文档规定 `src/flare/data` 模块的公共架构职责与模块边界。
 
 ## 模块职责边界
@@ -41,8 +43,9 @@ src/flare/data/
 ## 数据处理与发布时序
 
 `DataPipeline.run()` 装配处理流水线。特征配置先编译为处理产物和输出结构，
-并写出供消费端使用的特征清单。下面以带恢复状态的 HDFS 发布窗口为例；
-本地输入直接执行一个有限文件清单，不经过发布租约。
+并写出供消费端使用的特征清单。本地输入与分区输入共用确定性文件清单、发布窗口
+和租约协议。发现阶段先筛选未处理文件；无匹配文件时报错，输入全部完成则直接返回，
+不启动 Ray 或再次追加数据。下面展示每个有限发布窗口的处理过程。
 
 ```mermaid
 sequenceDiagram
@@ -88,12 +91,22 @@ sequenceDiagram
 - **生产与消费分离**：生产端恢复状态记录文件发布进度；训练或评估的检查点记录
   消费进度。消费者通过已提交的存储状态发现数据，两套进度独立。
 
+## 外部来源与 Catalog 会话
+
+`PartitionedSourceProvider` 提供目录列举和文件读取；`IcebergCatalogProvider`
+提供表访问。driver 和 worker 各自打开、关闭会话，不共享已打开的连接。
+普通 Iceberg 配置使用 `ConfiguredIcebergCatalogProvider`。
+
+发布、快照检查和恢复使用同一套 Catalog 接口。写入要求表 schema 匹配，不自动修改
+表结构。平台身份、凭据刷新及血缘由集成方管理，公共 Flare 无需安装平台 SDK。
+
 ## 代码入口与后续阅读
 
 | 入口 | 作用 |
 | --- | --- |
 | [`DataPipeline.run()`](../src/flare/data/pipeline/production/pipeline.py) | 配置解析、恢复对账与执行装配 |
 | [`RayDataPipeline.execute()`](../src/flare/data/pipeline/production/publish/orchestrator.py) | 读取、解析、特征处理与终端执行 |
+| [`discover_publication_manifest()` / `publish_manifest()`](../src/flare/data/pipeline/production/publish/runner.py) | 来源发现、已处理文件过滤与有限窗口发布 |
 | [`execute_publication()`](../src/flare/data/pipeline/production/publication/session.py) | 发布租约及完成状态 |
 | [`IcebergSnapshotPublisher`](../src/flare/data/connectors/adapters/iceberg/sink.py) | 事务发布及提交核验 |
 

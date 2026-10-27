@@ -1,5 +1,7 @@
 # Data Pipeline Architecture
 
+[中文](data_pipeline_architecture_zh.md)
+
 This document defines the architectural responsibilities and module boundaries of `src/flare/data`.
 
 ## Module Boundaries
@@ -30,13 +32,21 @@ src/flare/data/
 
 File row numbers, scan positions, and execution steps belong to different coordinate spaces. Flare readers decode and materialize assigned ranges; they do not discover tables or invent global cursors. Model and source states are joined exclusively through the checkpoint contract.
 
+## Storage and Progress
+
+Consumers read committed tables and metadata through bounded or continuous scans.
+Producers do not send consumers private task lists or progress files.
+`create_scan_planner` plans scans, readers load assigned ranges, and checkpoints
+align model state with source progress.
+
 ## Processing and Publication Sequence
 
 `DataPipeline.run()` assembles the production pipeline. Feature configuration is
 compiled into a processing artifact and output schema, and a feature manifest is
-written for consumers. The sequence below uses HDFS publication windows with
-resume state. Local input executes one finite file manifest directly, without a
-publication lease.
+written for consumers. Local and partitioned inputs share deterministic file
+manifests, publication windows and leases. Discovery filters committed files first:
+missing input raises an error, while fully processed input returns without starting
+Ray or appending data again. The sequence below shows each finite publication window.
 
 ```mermaid
 sequenceDiagram
@@ -87,12 +97,25 @@ sequenceDiagram
   training or evaluation checkpoints track consumption. Consumers discover data
   through committed storage state, independently of production resume records.
 
+## Source and Catalog Sessions
+
+`PartitionedSourceProvider` supplies directory listing and file reads;
+`IcebergCatalogProvider` supplies table access. Drivers and workers open and close
+their own sessions instead of sharing live connections. Ordinary Iceberg settings
+use `ConfiguredIcebergCatalogProvider`.
+
+Publication, snapshot checks and recovery use the same catalog interface. Writes
+require a matching table schema and do not change it automatically. Integrations
+manage platform identity, credential refresh and lineage; public Flare does not
+require a platform SDK.
+
 ## Code Entrypoints and Further Reading
 
 | Entrypoint | Responsibility |
 | --- | --- |
 | [`DataPipeline.run()`](../src/flare/data/pipeline/production/pipeline.py) | Configuration, reconciliation and runtime assembly |
 | [`RayDataPipeline.execute()`](../src/flare/data/pipeline/production/publish/orchestrator.py) | Reading, parsing, feature processing and terminal execution |
+| [`discover_publication_manifest()` / `publish_manifest()`](../src/flare/data/pipeline/production/publish/runner.py) | Source discovery, committed-file filtering and finite publication windows |
 | [`execute_publication()`](../src/flare/data/pipeline/production/publication/session.py) | Publication leases and completion state |
 | [`IcebergSnapshotPublisher`](../src/flare/data/connectors/adapters/iceberg/sink.py) | Transactional publication and commit verification |
 

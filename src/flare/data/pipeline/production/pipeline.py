@@ -34,9 +34,9 @@ from flare.data.pipeline.production.publish.runner import (
     _resolve_feature_manifest_dir,
     _resolve_output_path,
     _resolve_resume_state_path,
-    _run_hdfs_mode,
-    _run_local_mode,
     _validate_output_arguments,
+    discover_publication_manifest,
+    publish_manifest,
 )
 from flare.runtime.ray import RayConfig
 
@@ -143,6 +143,17 @@ class DataPipeline:
                 uri=args.iceberg_catalog_uri,
                 warehouse=args.iceberg_catalog_warehouse,
             )
+        from flare.data.connectors.adapters.iceberg.access import (
+            ConfiguredIcebergCatalogProvider,
+        )
+        from flare.io.aws import get_pyiceberg_s3_kwargs
+
+        if args.output_format == "iceberg":
+            options = dict(iceberg_catalog_kwargs)
+            options.update(get_pyiceberg_s3_kwargs(storage_options))
+            catalog_provider = ConfiguredIcebergCatalogProvider(options)
+        else:
+            catalog_provider = None
 
         state_manager = ResumeStateManager(args.resume_state_path, storage_options)
         if args.overwrite:
@@ -154,9 +165,12 @@ class DataPipeline:
                     args,
                     state_manager,
                     in_flight,
-                    iceberg_catalog_kwargs,
+                    catalog_provider,
                 )
 
+        manifest = discover_publication_manifest(args, state_manager)
+        if manifest is None:
+            return
         if not ray.is_initialized():
             _initialize_ray(args)
 
@@ -210,26 +224,18 @@ class DataPipeline:
 
         output_publisher = _build_output_publisher(
             args,
-            iceberg_catalog_kwargs,
-            storage_options,
+            catalog_provider,
             pipeline,
         )
         pipeline.write_feature_manifest(
             Path(_resolve_feature_manifest_dir(args.output, args.output_format))
         )
 
-        if args.input:
-            _run_local_mode(
-                args,
-                pipeline,
-                output_publisher,
-            )
-            return
-
         reporter = CompositeProgressReporter(
             [RayGaugeProgressReporter(), LoggingProgressReporter(logger)]
         )
-        _run_hdfs_mode(
+        publish_manifest(
+            manifest,
             args,
             state_manager,
             pipeline,

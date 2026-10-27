@@ -4,6 +4,9 @@ import time
 import pyarrow as pa
 import ray
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.catalog import build_iceberg_catalog_kwargs
 from flare.data.connectors.adapters.iceberg.sink import IcebergSnapshotPublisher
 from flare.data.contracts.sink import PublicationIdentity
@@ -48,7 +51,7 @@ def main():
 
     consumer = IcebergSnapshotPublisher(
         table_identifier=table_identifier,
-        catalog_kwargs=catalog_kwargs,
+        catalog_provider=ConfiguredIcebergCatalogProvider(catalog_kwargs),
         write_task_num_cpus=DEFAULT_WRITE_TASK_NUM_CPUS,
     )
     result = consumer.publish(

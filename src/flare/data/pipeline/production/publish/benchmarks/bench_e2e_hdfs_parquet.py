@@ -26,6 +26,10 @@ from datetime import date
 from pathlib import Path
 from typing import Literal
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -40,7 +44,7 @@ from flare.data.pipeline.production.publish.config import PipelineConfig
 from flare.data.pipeline.production.publish.orchestrator import (
     RayDataPipeline,
 )
-from flare.io.aws import S3Config
+from flare.io.aws import S3Config, get_pyiceberg_s3_kwargs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -228,15 +232,19 @@ def main() -> None:
     else:
         publisher = IcebergSnapshotPublisher(
             table_identifier=args.output,
-            catalog_kwargs=build_iceberg_catalog_kwargs(
-                name=args.iceberg_catalog_name,
-                catalog_type=args.iceberg_catalog_type,
-                uri=args.iceberg_catalog_uri,
-                warehouse=args.iceberg_catalog_warehouse,
+            catalog_provider=ConfiguredIcebergCatalogProvider(
+                {
+                    **build_iceberg_catalog_kwargs(
+                        name=args.iceberg_catalog_name,
+                        catalog_type=args.iceberg_catalog_type,
+                        uri=args.iceberg_catalog_uri,
+                        warehouse=args.iceberg_catalog_warehouse,
+                    ),
+                    **get_pyiceberg_s3_kwargs(s3_options),
+                }
             ),
             write_task_num_cpus=config.write_task_num_cpus,
             write_concurrency=config.write_concurrency,
-            storage_options=s3_options,
         )
         from flare.data.contracts.sink import PublicationIdentity
 

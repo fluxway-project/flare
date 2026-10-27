@@ -382,12 +382,20 @@ def hdfs_ls_parallel(hdfs_dirs: list[str], max_workers: int = 24) -> list[str]:
     return all_files
 
 
-def hdfs_ls_parallel_iter(hdfs_dirs: list[str], max_workers: int = 24) -> Iterator[str]:
+def hdfs_ls_parallel_iter(
+    hdfs_dirs: list[str],
+    max_workers: int = 24,
+    *,
+    list_directory: Callable[[str], list[str]] | None = None,
+) -> Iterator[str]:
     """List directories concurrently and yield entries in input order."""
     if max_workers <= 0:
         raise ValueError(f"max_workers must be positive, got {max_workers}")
+    list_directory = hdfs_ls if list_directory is None else list_directory
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(hdfs_ls, directory) for directory in hdfs_dirs]
+        futures = [
+            executor.submit(list_directory, directory) for directory in hdfs_dirs
+        ]
         for future in futures:
             yield from sorted(future.result())
 
@@ -557,12 +565,18 @@ def collect_hdfs_file_paths(hdfs_root: str, start: date, end: date) -> list[str]
     return list(iter_hdfs_file_paths(hdfs_root, start, end))
 
 
-def iter_hdfs_file_paths(hdfs_root: str, start: date, end: date) -> Iterator[str]:
+def iter_hdfs_file_paths(
+    hdfs_root: str,
+    start: date,
+    end: date,
+    *,
+    list_directory: Callable[[str], list[str]] | None = None,
+) -> Iterator[str]:
     """Stream HDFS file discovery without retaining the complete manifest."""
     d = start
 
     # Local filesystem source
-    if os.path.exists(hdfs_root):
+    if list_directory is None and os.path.exists(hdfs_root):
         while d <= end:
             date_dir = os.path.join(hdfs_root, f"ds={d.isoformat()}")
             if os.path.exists(date_dir):
@@ -573,10 +587,13 @@ def iter_hdfs_file_paths(hdfs_root: str, start: date, end: date) -> Iterator[str
             d += timedelta(days=1)
         return
 
+    list_directory = hdfs_ls if list_directory is None else list_directory
     while d <= end:
         date_dir = f"{hdfs_root}/ds={d.isoformat()}"
-        hour_dirs = sorted(hdfs_ls(date_dir))
-        for f in hdfs_ls_parallel_iter(hour_dirs, max_workers=24):
+        hour_dirs = sorted(list_directory(date_dir))
+        for f in hdfs_ls_parallel_iter(
+            hour_dirs, max_workers=24, list_directory=list_directory
+        ):
             fname = f.rsplit("/", 1)[-1]
             if fname != "_SUCCESS" and fname.endswith(".zst"):
                 yield f

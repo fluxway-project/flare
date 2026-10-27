@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID
 
 import pyarrow as pa
 
@@ -29,6 +31,11 @@ def _publisher(*, observe_file_layout: bool) -> IcebergSnapshotPublisher:
     publisher._asset_namespace = ConfiguredIcebergCatalogProvider(
         publisher._catalog_kwargs
     ).identity
+    table = SimpleNamespace(metadata=SimpleNamespace(table_uuid=UUID(int=1)))
+    publisher._catalog_provider = SimpleNamespace(
+        identity=publisher._asset_namespace,
+        open=lambda: nullcontext(SimpleNamespace(load_table=lambda _: table)),
+    )
     publisher._table_identifier = "db.table"
     publisher._observe_file_layout = observe_file_layout
     publisher._write_task_num_cpus = 1.0

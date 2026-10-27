@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import closing
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import ray
 
 from flare.data.connectors.adapters.iceberg.access import (
-    ConfiguredIcebergCatalogProvider,
-)
-from flare.data.connectors.adapters.iceberg.catalog import (
-    load_iceberg_table,
-    normalize_iceberg_catalog_kwargs,
+    IcebergCatalogProvider,
+    IcebergTableSession,
 )
 from flare.data.connectors.adapters.iceberg.fixed_schema_append import (
     FixedSchemaAppendIcebergDatasink,
@@ -36,7 +34,6 @@ from flare.data.pipeline.production.publication.contract import (
     PublicationProtocol,
     validate_publication_id,
 )
-from flare.io.aws import get_pyiceberg_s3_kwargs
 
 if TYPE_CHECKING:
     import ray.data
@@ -72,11 +69,10 @@ class IcebergSnapshotPublisher:
     def __init__(
         self,
         table_identifier: str,
-        catalog_kwargs: dict[str, Any],
+        catalog_provider: IcebergCatalogProvider,
         write_task_num_cpus: float,
         snapshot_properties: dict[str, str] | None = None,
         write_concurrency: int | None = None,
-        storage_options: dict[str, Any] | None = None,
         writer_target_size_bytes: int = DEFAULT_WRITER_TARGET_SIZE_BYTES,
         observe_file_layout: bool = False,
     ):
@@ -96,14 +92,8 @@ class IcebergSnapshotPublisher:
             raise TypeError("observe_file_layout must be bool")
         self._observe_file_layout = observe_file_layout
 
-        merged_catalog_kwargs = dict(catalog_kwargs)
-        if storage_options:
-            merged_catalog_kwargs.update(get_pyiceberg_s3_kwargs(storage_options))
-
-        self._catalog_kwargs = normalize_iceberg_catalog_kwargs(merged_catalog_kwargs)
-        self._asset_namespace = ConfiguredIcebergCatalogProvider(
-            self._catalog_kwargs
-        ).identity
+        self._catalog_provider = catalog_provider
+        self._asset_namespace = catalog_provider.identity
         self._snapshot_properties = dict(snapshot_properties or {})
         if PUBLICATION_ID_PROPERTY in self._snapshot_properties:
             raise ValueError(
@@ -113,11 +103,10 @@ class IcebergSnapshotPublisher:
         self._load_table_properties()
 
     def _load_table_properties(self) -> dict[str, str]:
-        self._table = load_iceberg_table(
-            self._catalog_kwargs,
-            self._table_identifier,
-        )
-        table_properties = dict(self._table.properties)
+        with closing(
+            IcebergTableSession(self._catalog_provider, self._table_identifier)
+        ) as session:
+            table_properties = dict(session.table().properties)
         validate_iceberg_table_properties(
             table_properties,
             expected_writer_target_size_bytes=self._writer_target_size_bytes,
@@ -131,7 +120,7 @@ class IcebergSnapshotPublisher:
         write_seconds: float,
     ) -> IcebergCommitObservation:
         return observe_committed_publication(
-            catalog_kwargs=self._catalog_kwargs,
+            catalog_provider=self._catalog_provider,
             table_identifier=self._table_identifier,
             expected_publication_id=publication_id,
             write_seconds=write_seconds,
@@ -148,11 +137,14 @@ class IcebergSnapshotPublisher:
         schema: pa.Schema,
         publication: PublicationIdentity,
     ) -> SinkResult:
-        expected_iceberg_schema = validate_iceberg_table(
-            self._table,
-            expected_schema=schema,
-            expected_writer_target_size_bytes=self._writer_target_size_bytes,
-        )
+        with closing(
+            IcebergTableSession(self._catalog_provider, self._table_identifier)
+        ) as session:
+            expected_iceberg_schema = validate_iceberg_table(
+                session.table(),
+                expected_schema=schema,
+                expected_writer_target_size_bytes=self._writer_target_size_bytes,
+            )
         snapshot_properties = dict(self._snapshot_properties)
         publication_id = validate_publication_id(publication.value)
         snapshot_properties[PUBLICATION_ID_PROPERTY] = publication_id
@@ -160,7 +152,7 @@ class IcebergSnapshotPublisher:
             expected_schema=schema,
             expected_iceberg_schema=expected_iceberg_schema,
             table_identifier=self._table_identifier,
-            catalog_kwargs=self._catalog_kwargs,
+            catalog_provider=self._catalog_provider,
             snapshot_properties=snapshot_properties,
         )
         write_started = time.perf_counter()

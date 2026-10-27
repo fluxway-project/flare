@@ -7,10 +7,12 @@ import itertools
 import logging
 import time
 import urllib.parse
+from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 from typing import Any
 
+from flare.data.connectors.adapters.iceberg.access import IcebergCatalogProvider
 from flare.data.connectors.adapters.iceberg.recovery import reconcile_iceberg_in_flight
 from flare.data.connectors.adapters.iceberg.sink import IcebergSnapshotPublisher
 from flare.data.connectors.adapters.iceberg.table import (
@@ -37,6 +39,7 @@ from flare.data.pipeline.production.publication.window import (
 from flare.data.pipeline.production.publish.resource_profile import (
     estimate_arrow_row_bytes,
 )
+from flare.data.pipeline.production.publish.source import PartitionedSourceProvider
 from flare.runtime.ray import LocalRayInitOptions, initialize_ray_runtime
 
 logger = logging.getLogger(__name__)
@@ -149,8 +152,7 @@ def _resolve_writer_target_size_bytes(args: Any) -> int:
 
 def _build_output_publisher(
     args: Any,
-    catalog_kwargs: dict[str, Any],
-    storage_options: dict[str, Any],
+    catalog_provider: IcebergCatalogProvider | None,
     pipeline: Any,
 ) -> Any:
     if args.output_format == "parquet":
@@ -163,12 +165,13 @@ def _build_output_publisher(
         )
     if args.output_format != "iceberg":
         raise ValueError(f"unsupported output format: {args.output_format!r}")
+    if catalog_provider is None:
+        raise ValueError("Iceberg output requires a catalog provider")
     return IcebergSnapshotPublisher(
         table_identifier=args.output,
-        catalog_kwargs=catalog_kwargs,
+        catalog_provider=catalog_provider,
         write_task_num_cpus=pipeline.config.write_task_num_cpus,
         write_concurrency=pipeline.config.write_concurrency,
-        storage_options=storage_options,
         writer_target_size_bytes=_resolve_writer_target_size_bytes(args),
         observe_file_layout=args.iceberg_commit_layout_observation,
     )
@@ -261,9 +264,9 @@ def _reconcile_in_flight(
     args: Any,
     state_manager: ResumeStateManager,
     in_flight: Any,
-    iceberg_catalog_kwargs: dict[str, Any],
+    catalog_provider: IcebergCatalogProvider | None,
 ) -> None:
-    if args.output_format != "iceberg":
+    if args.output_format != "iceberg" or catalog_provider is None:
         raise RuntimeError(
             "Cannot reconcile in-flight publications for output format: "
             f"{args.output_format}"
@@ -271,70 +274,70 @@ def _reconcile_in_flight(
     reconcile_iceberg_in_flight(
         state_manager,
         in_flight,
-        catalog_kwargs=iceberg_catalog_kwargs,
+        catalog_provider=catalog_provider,
         table_identifier=args.output,
     )
     logger.info("Reconciled %d in-flight publications.", len(in_flight))
 
 
-def _run_local_mode(
+def discover_publication_manifest(
     args: Any,
-    pipeline: Any,
-    output: Any,
-) -> None:
-    """Publish one finite local source manifest through one execution."""
-    input_path = getattr(args, "input", None)
-    if input_path is None:
-        raise ValueError("local mode requires input path")
-    logger.info("Local mode: processing %s", input_path)
-    file_paths = _iter_local_input_paths(input_path)
-    limit_files = getattr(args, "limit_files", None)
-    if limit_files is not None:
-        file_paths = itertools.islice(file_paths, limit_files)
-    manifest = PublicationManifest.from_files(file_paths)
-    result = pipeline.execute(
-        manifest.files,
-        _bind_manifest_terminal(output, manifest),
+    state_manager: PublicationPendingStore,
+    source_provider: PartitionedSourceProvider | None = None,
+) -> PublicationManifest | None:
+    context = (
+        source_provider.open() if source_provider is not None else nullcontext(None)
     )
-    if result.total_rows == 0:
-        raise FileNotFoundError(f"No supported local input files under: {input_path}")
-    logger.info(
-        "Local publication complete: %d files, %d rows.",
-        len(manifest.files),
-        result.total_rows,
-    )
+    with context as source:
+        if source is not None:
+            paths = iter_hdfs_file_paths(
+                source.root,
+                date.fromisoformat(args.start_date),
+                date.fromisoformat(args.end_date),
+                list_directory=source.list_directory,
+            )
+        elif args.input is not None:
+            paths = _iter_local_input_paths(args.input)
+        else:
+            paths = iter_hdfs_file_paths(
+                args.hdfs_root,
+                date.fromisoformat(args.start_date),
+                date.fromisoformat(args.end_date),
+            )
+        limit_files = getattr(args, "limit_files", None)
+        if limit_files is not None:
+            paths = itertools.islice(paths, limit_files)
+        discovered = 0
+        pending = []
+        for path in paths:
+            discovered += 1
+            if state_manager.is_pending(path):
+                pending.append(path)
+    if not discovered:
+        raise FileNotFoundError(
+            "No source files match the requested input and date range"
+        )
+    if not pending:
+        logger.info("All %d source files are already committed.", discovered)
+        return None
+    return PublicationManifest.from_files(pending)
 
 
-def _run_hdfs_mode(
+def publish_manifest(
+    manifest: PublicationManifest,
     args: Any,
     state_manager: PublicationPendingStore,
     pipeline: ManifestExecutor,
     output: Any,
     progress_reporter: PublicationProgressReporter,
-) -> None:
-    """Publish one finite HDFS source manifest through one Ray execution."""
-    hdfs_root = getattr(args, "hdfs_root", None)
-    if hdfs_root is None:
-        raise RuntimeError("HDFS mode requires hdfs_root")
-    start = date.fromisoformat(args.start_date)
-    end = date.fromisoformat(args.end_date)
-    logger.info("Enumerating HDFS partitions %s → %s ...", start, end)
-
-    discovered_paths = iter_hdfs_file_paths(hdfs_root, start, end)
-    limit_files = getattr(args, "limit_files", None)
-    if limit_files is not None:
-        discovered_paths = itertools.islice(discovered_paths, limit_files)
-        logger.info("Limiting streaming discovery to %d files.", limit_files)
-
-    manifest = PublicationManifest.from_files(
-        path for path in discovered_paths if state_manager.is_pending(path)
-    )
+):
     publication_window_files = getattr(args, "publication_window_files", None)
     if publication_window_files is None:
-        raise RuntimeError("HDFS publication window size was not resolved")
+        publication_window_files = len(manifest.files)
     windows = partition_publication_manifest(manifest, publication_window_files)
     completed_files = 0
     total_rows = 0
+    last_result = None
     for index, window in enumerate(windows, start=1):
         started = time.perf_counter()
         result = execute_publication(
@@ -345,6 +348,7 @@ def _run_hdfs_mode(
             lease_store=state_manager,
         )
         completed_files += len(window.files)
+        last_result = result
         total_rows += result.total_rows
         progress_reporter.update(
             current=completed_files,
@@ -366,6 +370,7 @@ def _run_hdfs_mode(
         total_rows,
         len(windows),
     )
+    return last_result
 
 
 __all__ = [
@@ -382,7 +387,7 @@ __all__ = [
     "_resolve_output_path",
     "_resolve_resume_state_path",
     "_resolve_writer_target_size_bytes",
-    "_run_hdfs_mode",
-    "_run_local_mode",
     "_validate_output_arguments",
+    "discover_publication_manifest",
+    "publish_manifest",
 ]

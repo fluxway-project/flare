@@ -20,6 +20,7 @@ from pathlib import Path
 import pyarrow as pa
 import ray.data
 
+from flare.data.contracts.assets import AssetRef
 from flare.data.execution.plan.physical import PhysicalPlan, PhysicalStage
 from flare.data.execution.plan.terminal import DatasetTerminal
 from flare.data.execution.ray.stage_runtime import apply_physical_plan
@@ -38,6 +39,7 @@ from flare.data.pipeline.production.publish.read_profile import (
 from flare.data.pipeline.production.publish.resource_profile import (
     estimate_arrow_row_bytes,
 )
+from flare.data.pipeline.production.publish.source import PartitionedSourceProvider
 from flare.data.pipeline.production.publish.stage_profile import (
     collect_stage_profile_summary,
     create_stage_profile_collector,
@@ -59,6 +61,7 @@ class BatchResult:
 
     total_rows: int
     elapsed_seconds: float
+    outputs: tuple[AssetRef, ...] = ()
 
 
 class RayDataPipeline:
@@ -74,8 +77,10 @@ class RayDataPipeline:
         category_values: Mapping[str, Mapping[int, int]] | None = None,
         auto_category_features: frozenset[str] = frozenset(),
         log_ray_data_stats: bool = False,
+        source_provider: PartitionedSourceProvider | None = None,
     ):
         self._config = config
+        self._source_provider = source_provider
         self._log_ray_data_stats = log_ray_data_stats
 
         # Disable Ray Data progress bars to prevent messy logs from worker nodes
@@ -172,6 +177,7 @@ class RayDataPipeline:
             )
 
         datasource = HdfsZstdDatasource(
+            source_provider=self._source_provider,
             file_paths=file_paths,
             source_csv_block_size_bytes=self._config.source_csv_block_size_bytes,
             read_planner_block_bytes=self._config.read_planner_block_bytes,
@@ -304,7 +310,11 @@ class RayDataPipeline:
             elapsed,
             result.total_rows / max(elapsed, 0.001),
         )
-        return BatchResult(total_rows=result.total_rows, elapsed_seconds=elapsed)
+        return BatchResult(
+            total_rows=result.total_rows,
+            elapsed_seconds=elapsed,
+            outputs=result.outputs,
+        )
 
     def _configure_execution_context(self) -> None:
         ctx = ray.data.DataContext.get_current()
@@ -333,7 +343,7 @@ class RayDataPipeline:
             ctx.downstream_capacity_backpressure_ratio,
             ctx.enable_dynamic_output_queue_size_backpressure,
             ctx._max_num_blocks_in_streaming_gen_buffer,
-            ctx.eager_free,
+            self._config.eager_free,
         )
 
     def shutdown(self) -> None:

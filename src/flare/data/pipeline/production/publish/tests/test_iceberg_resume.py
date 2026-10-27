@@ -25,13 +25,13 @@ def _reconcile(snapshots, in_flight=None):
     table = Mock()
     table.snapshots.return_value = snapshots
     with patch(
-        "flare.data.connectors.adapters.iceberg.recovery.load_iceberg_table",
-        return_value=table,
+        "flare.data.connectors.adapters.iceberg.recovery.IcebergTableSession",
+        return_value=SimpleNamespace(table=lambda: table, close=lambda: None),
     ):
         reconcile_iceberg_in_flight(
             state_manager,
             in_flight or {"abc": _lease()},
-            catalog_kwargs={"name": "catalog"},
+            catalog_provider=Mock(),
             table_identifier="db.table",
         )
     return state_manager

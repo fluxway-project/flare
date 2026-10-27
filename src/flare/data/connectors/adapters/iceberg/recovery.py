@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import closing
 from typing import Any
 
-from flare.data.connectors.adapters.iceberg.catalog import load_iceberg_table
+from flare.data.connectors.adapters.iceberg.access import (
+    IcebergCatalogProvider,
+    IcebergTableSession,
+)
 from flare.data.pipeline.production.publication.contract import (
     PUBLICATION_ID_PROPERTY,
     PublicationLease,
@@ -18,7 +22,7 @@ def reconcile_iceberg_in_flight(
     state_manager: Any,
     in_flight: Mapping[str, PublicationLease],
     *,
-    catalog_kwargs: Mapping[str, Any],
+    catalog_provider: IcebergCatalogProvider,
     table_identifier: str,
 ) -> None:
     if not in_flight:
@@ -32,8 +36,8 @@ def reconcile_iceberg_in_flight(
         raise RuntimeError(
             "Cannot reconcile non-Iceberg publications: " + ", ".join(unsupported)
         )
-    table = load_iceberg_table(catalog_kwargs, table_identifier)
-    snapshots = list(table.snapshots())
+    with closing(IcebergTableSession(catalog_provider, table_identifier)) as session:
+        snapshots = list(session.table().snapshots())
 
     committed_counts: dict[str, int] = {}
     for snapshot in snapshots:
