@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_WRITE_TASK_NUM_CPUS = 1.0
 
 
+class WorkerMemoryCapacityError(ValueError):
+    """The requested streaming working set exceeds worker memory capacity."""
+
+
 @dataclass(frozen=True, slots=True)
 class RayClusterCapacity:
     cpu_count: int
@@ -731,7 +735,7 @@ class WorkerMemoryPlanner:
         # configuration impossible.  The two actor stages share this budget.
         minimum_required = read_task_memory_bytes + (2 * actor_memory)
         if heap_budget < minimum_required:
-            raise ValueError(
+            raise WorkerMemoryCapacityError(
                 "worker heap budget is too small for one streaming pipeline: "
                 f"budget={heap_budget}, required={minimum_required}"
             )

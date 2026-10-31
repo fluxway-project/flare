@@ -114,10 +114,24 @@ def test_iceberg_layout_observation_is_forwarded_to_publisher(
             }
         ),
         pipeline=_Pipeline(),
+        snapshot_properties={"flare.execution-engine": "fixture-engine"},
     )
 
     assert isinstance(publisher, _Publisher)
     assert captured["observe_file_layout"] is True
+    assert captured["snapshot_properties"] == {
+        "flare.execution-engine": "fixture-engine"
+    }
+
+
+def test_parquet_rejects_snapshot_properties(tmp_path) -> None:
+    with pytest.raises(ValueError, match="require Iceberg"):
+        _build_output_publisher(
+            _args(tmp_path),
+            catalog_provider=None,
+            pipeline=_Pipeline(),
+            snapshot_properties={"flare.execution-engine": "fixture-engine"},
+        )
 
 
 @pytest.mark.parametrize(

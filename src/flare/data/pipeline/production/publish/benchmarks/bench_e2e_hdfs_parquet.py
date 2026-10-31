@@ -1,21 +1,8 @@
-"""End-to-end benchmark: HDFS → line-parse (Cython) → cross + encode → Iceberg.
+"""Benchmark the streaming source, parsing, encoding and Iceberg write pipeline.
 
-Measures real-world throughput of the full streaming pipeline on the target
-hardware (8 GPU + 120 CPU single-node). Output: rows/sec, elapsed time,
-and per-stage breakdown.
-
-Compatible with ``ray job submit``:
-
-    ray job submit \\
-      --working-dir /path/to/flare-jax \\
-      --runtime-env-json '{"py_modules": ["dataset", "util", "conf"]}' \\
-      -- python dataset/publish/benchmarks/bench_e2e_hdfs_vortex.py \\
-         --hdfs-root /path/to/data \\
-         --output db.table \\
-         --start-date 2026-01-06 --end-date 2026-01-07 \\
-         --cpu-only --limit-files 100
-
-Target: ≥ 1,000,000 rows/sec sustained throughput.
+Invoke this module directly or through Ray Jobs. Callers supply the source URI,
+configuration directories, parser contract and catalog settings. Throughput and
+stage timings describe the selected hardware and workload.
 """
 
 import dataclasses
@@ -26,17 +13,13 @@ from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from flare.data.connectors.adapters.iceberg.access import (
-    ConfiguredIcebergCatalogProvider,
-)
-
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(_PROJECT_ROOT))
-
 import ray
 import ray.data
 import tyro
 
+from flare.data.connectors.adapters.iceberg.access import (
+    ConfiguredIcebergCatalogProvider,
+)
 from flare.data.connectors.adapters.iceberg.catalog import build_iceberg_catalog_kwargs
 from flare.data.pipeline.production.builder.hdfs_source import collect_hdfs_file_paths
 from flare.data.pipeline.production.processing.parser_contract import ParserContract
@@ -246,7 +229,7 @@ def main() -> None:
             write_task_num_cpus=config.write_task_num_cpus,
             write_concurrency=config.write_concurrency,
         )
-        from flare.data.contracts.sink import PublicationIdentity
+        from flare.data.contracts.publication import PublicationIdentity
 
         consumer = publisher.bind(PublicationIdentity("bench-e2e-hdfs-parquet-v1"))
 

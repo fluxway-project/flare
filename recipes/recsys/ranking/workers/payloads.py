@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, make_dataclass
-from typing import Any
+from typing import Any, ClassVar
 from weakref import WeakSet
 
 import jax.tree_util as jtu
@@ -14,7 +14,7 @@ from recipes.recsys.ranking.schema.sparse_features import parse_sparse_group_nam
 
 
 class _JaxDataTypeMeta(type):
-    _registered: WeakSet[type] = WeakSet()
+    _registered: ClassVar[WeakSet[type]] = WeakSet()
 
     def __setattr__(cls, name: str, value: Any) -> None:
         super().__setattr__(name, value)

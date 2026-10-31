@@ -5,7 +5,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from flare.data.pipeline.production.builder.constants import DEFAULT_NULL_SENTINEL
+from flare.data.contracts.constants import DEFAULT_NULL_SENTINEL
 from flare.data.pipeline.production.builder.encoding.base import (
     pack_sparse_i64_values,
     pack_sparse_u64_hashes,

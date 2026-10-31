@@ -28,12 +28,13 @@ from flare.data.connectors.adapters.iceberg.table import (
     validate_iceberg_table_properties,
 )
 from flare.data.contracts.assets import AssetRef
-from flare.data.contracts.sink import PublicationIdentity, SinkResult
-from flare.data.pipeline.production.publication.contract import (
+from flare.data.contracts.publication import (
     PUBLICATION_ID_PROPERTY,
+    PublicationIdentity,
     PublicationProtocol,
     validate_publication_id,
 )
+from flare.data.contracts.sink import SinkResult
 
 if TYPE_CHECKING:
     import ray.data
@@ -75,6 +76,7 @@ class IcebergSnapshotPublisher:
         write_concurrency: int | None = None,
         writer_target_size_bytes: int = DEFAULT_WRITER_TARGET_SIZE_BYTES,
         observe_file_layout: bool = False,
+        writer_min_rows_per_task: int | None = None,
     ):
         self._table_identifier = table_identifier
         if write_task_num_cpus <= 0:
@@ -88,6 +90,9 @@ class IcebergSnapshotPublisher:
                 f"got {writer_target_size_bytes}"
             )
         self._writer_target_size_bytes = writer_target_size_bytes
+        if writer_min_rows_per_task is not None and writer_min_rows_per_task <= 0:
+            raise ValueError("writer_min_rows_per_task must be positive")
+        self._writer_min_rows_per_task = writer_min_rows_per_task
         if not isinstance(observe_file_layout, bool):
             raise TypeError("observe_file_layout must be bool")
         self._observe_file_layout = observe_file_layout
@@ -149,6 +154,8 @@ class IcebergSnapshotPublisher:
         publication_id = validate_publication_id(publication.value)
         snapshot_properties[PUBLICATION_ID_PROPERTY] = publication_id
         datasink = FixedSchemaAppendIcebergDatasink(
+            coalesce_target_bytes=self._writer_target_size_bytes,
+            min_rows_per_write=self._writer_min_rows_per_task,
             expected_schema=schema,
             expected_iceberg_schema=expected_iceberg_schema,
             table_identifier=self._table_identifier,

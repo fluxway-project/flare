@@ -5,7 +5,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from flare.data.pipeline.production.builder.constants import NULL_FID_SENTINEL
+from flare.data.contracts.constants import NULL_FID_SENTINEL
 from flare.data.pipeline.production.builder.cross.base import register_fea
 from flare.data.pipeline.production.builder.cross.protocol import CrossComputeContext
 

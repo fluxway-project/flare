@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
+from flare.data.contracts.publication import PublicationProtocol
 from flare.data.contracts.sink import SinkResult
-from flare.data.pipeline.production.publication.contract import PublicationProtocol
 from flare.data.pipeline.production.publication.manifest import PublicationManifest
 from flare.data.pipeline.production.publication.session import execute_publication
 from flare.data.pipeline.production.publication.window import (

@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from flare.data.pipeline.production.builder.constants import (
+from flare.data.contracts.constants import (
     DEFAULT_FLOAT_NULL_SENTINEL,
     DEFAULT_MISSING_FLOAT,
     DEFAULT_MISSING_INT,

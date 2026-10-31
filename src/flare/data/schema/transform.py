@@ -8,7 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from flare.data.pipeline.production.builder.constants import NULL_FID_SENTINEL
+from flare.data.contracts.constants import NULL_FID_SENTINEL
 from flare.data.schema.batch import RaggedFeatureBatch
 from flare.data.schema.feature_catalog import FeatureOutputKind
 from flare.data.schema.feature_layout import TrainingFeatureLayout

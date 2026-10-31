@@ -6,8 +6,8 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 import pyarrow as pa
 
+from flare.data.contracts import publication as publication_contracts
 from flare.data.contracts.assets import AssetRef
-from flare.data.pipeline.production.publication.contract import PublicationIdentity
 
 PayloadT_contra = TypeVar("PayloadT_contra", contravariant=True)
 
@@ -33,10 +33,13 @@ class TransactionalSink(Protocol[PayloadT_contra]):
         payload: PayloadT_contra,
         *,
         schema: pa.Schema,
-        publication: PublicationIdentity,
+        publication: publication_contracts.PublicationIdentity,
     ) -> SinkResult | Awaitable[SinkResult]: ...
 
 
 @runtime_checkable
 class StreamingSink(Protocol[PayloadT_contra]):
     def consume(self, payload: PayloadT_contra, *, schema: pa.Schema) -> SinkResult: ...
+
+
+__all__ = ["SinkResult", "StreamingSink", "TransactionalSink"]

@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from flare.data.connectors.adapters.iceberg.recovery import reconcile_iceberg_in_flight
-from flare.data.pipeline.production.publication.contract import (
+from flare.data.contracts.publication import (
     PublicationLease,
     PublicationProtocol,
 )
@@ -67,9 +67,9 @@ def test_duplicate_publication_id_is_rejected() -> None:
         _reconcile(snapshots)
 
 
-@pytest.mark.parametrize("summary", [None, []])
-def test_invalid_snapshot_summary_is_rejected(summary) -> None:
-    with pytest.raises(RuntimeError, match="snapshot summary"):
+@pytest.mark.parametrize(("summary", "error"), [(None, RuntimeError), ([], TypeError)])
+def test_invalid_snapshot_summary_is_rejected(summary, error) -> None:
+    with pytest.raises(error, match="snapshot summary"):
         _reconcile([_snapshot(summary)])
 
 

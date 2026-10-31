@@ -32,13 +32,12 @@ from ray.data import Datasource, ReadTask
 from ray.data.block import BlockMetadata
 
 from flare.data.pipeline.production.builder.hdfs_source import (
-    ResilientWebHdfsReader,
-    _base_url,
-    _full_path,
+    open_hdfs_file,
 )
 from flare.data.pipeline.production.publish.partitioning import (
     PARTITION_COLUMNS,
     source_partition_values,
+    validate_partition_defaults,
 )
 from flare.data.pipeline.production.publish.read_profile import (
     ReadProfile,
@@ -47,15 +46,6 @@ from flare.data.pipeline.production.publish.read_profile import (
 from flare.data.pipeline.production.publish.source import PartitionedSourceProvider
 
 logger = logging.getLogger(__name__)
-
-_CONNECT_TIMEOUT_S = 30
-_READ_TIMEOUT_S = 600
-
-
-def _url_resolver(hdfs_path: str) -> str:
-    """Construct WebHDFS OPEN URL for a given HDFS path."""
-    full = _full_path(hdfs_path)
-    return f"{_base_url(full)}&path={full}&op=OPEN"
 
 
 class HdfsZstdDatasource(Datasource):
@@ -80,6 +70,7 @@ class HdfsZstdDatasource(Datasource):
         read_profile: bool = False,
         read_profile_collector: typing.Any | None = None,
         source_provider: PartitionedSourceProvider | None = None,
+        source_partition_defaults: dict[str, str] | None = None,
     ):
         self._file_paths = tuple(file_paths)
         if source_csv_block_size_bytes <= 0:
@@ -121,6 +112,9 @@ class HdfsZstdDatasource(Datasource):
         self._read_profile = read_profile
         self._read_profile_collector = read_profile_collector
         self._source_provider = source_provider
+        self._source_partition_defaults = validate_partition_defaults(
+            source_partition_defaults
+        )
 
     def get_read_tasks(
         self,
@@ -153,6 +147,7 @@ class HdfsZstdDatasource(Datasource):
                 read_profile=self._read_profile,
                 read_profile_collector=self._read_profile_collector,
                 source_provider=self._source_provider,
+                source_partition_defaults=self._source_partition_defaults,
             ):
                 context = (
                     source_provider.open()
@@ -173,6 +168,7 @@ class HdfsZstdDatasource(Datasource):
                             reader_factory=factory,
                             read_profile=read_profile,
                             read_profile_collector=read_profile_collector,
+                            source_partition_defaults=source_partition_defaults,
                         )
 
             tasks.append(ReadTask(read_fn, metadata))
@@ -355,17 +351,7 @@ def default_prefetch_reader_factory(
     profile: ReadProfile | None = None,
     source=None,
 ) -> io.RawIOBase:
-    reader = (
-        source.open(hdfs_path)
-        if source is not None
-        else ResilientWebHdfsReader(
-            hdfs_path,
-            url_resolver=_url_resolver,
-            max_retries=5,
-            connect_timeout=_CONNECT_TIMEOUT_S,
-            read_timeout=_READ_TIMEOUT_S,
-        )
-    )
+    reader = source.open(hdfs_path) if source is not None else open_hdfs_file(hdfs_path)
     if profile is None:
         return PrefetchReader(reader, max_buffers=max_buffers, buffer_size=buffer_size)
     return ProfiledPrefetchReader(
@@ -386,6 +372,7 @@ def _read_decompress_file(
     reader_factory: typing.Callable[..., io.RawIOBase],
     read_profile: bool = False,
     read_profile_collector: typing.Any | None = None,
+    source_partition_defaults: dict[str, str] | None = None,
 ):
     """ReadTask body: stream → decompress → yield raw-line blocks.
 
@@ -399,7 +386,9 @@ def _read_decompress_file(
         raise TypeError(f"read_profile must be bool, got {type(read_profile).__name__}")
     if read_profile and read_profile_collector is None:
         raise ValueError("read profile requires a read profile collector")
-    partition_values = source_partition_values(hdfs_path)
+    partition_values = source_partition_values(
+        hdfs_path, defaults=source_partition_defaults
+    )
 
     t0 = time.perf_counter()
     total_lines = 0

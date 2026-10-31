@@ -9,7 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from flare.data.pipeline.production.builder.constants import (
+from flare.data.contracts.constants import (
     BUCKET_EPSILON,
     NULL_FID_SENTINEL,
 )

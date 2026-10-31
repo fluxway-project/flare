@@ -1,4 +1,4 @@
-"""Publication identity, lease contracts, and artifact store contracts."""
+"""Storage-independent publication identities and lease protocols."""
 
 from __future__ import annotations
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from flare.data.contracts.assets import AssetRef
-from flare.data.pipeline.production.publication.contract import validate_publication_id
+from flare.data.contracts.publication import validate_publication_id
 
 
 @dataclass(frozen=True, slots=True)

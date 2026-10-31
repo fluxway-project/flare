@@ -104,10 +104,36 @@ sequenceDiagram
 their own sessions instead of sharing live connections. Ordinary Iceberg settings
 use `ConfiguredIcebergCatalogProvider`.
 
+Without an injected source provider, discovery and reads use the standard
+filesystem selected by PyArrow from the URI. Custom gateway discovery,
+authentication protocols and deployment identities belong to external providers;
+the public data layer does not select deployment modes from environment variables.
+New transports implement and inject the existing source protocol.
+
+Partition defaults are explicit `source_partition_defaults` values supplied by the
+caller. The Iceberg format adapter accepts row-count hints and byte coalescing
+targets without interpreting model feature metadata. Feature-aware producers
+estimate and inject their row-count hints during assembly.
+
+Iceberg publication identity indexing and record-count validation live in the
+format adapter's `publication` module. Writers, recovery and integration reports
+reuse those rules. HTTP retry, pooling and keepalive policy live in `flare.io.http`;
+source adapters own only their protocol and session lifecycle.
+
+Publication value objects and protocols have a single definition in
+`flare.data.contracts.publication`; shared sentinel values live in
+`flare.data.contracts.constants`. Storage adapters and contracts do not import
+production implementations or application configuration.
+
 Publication, snapshot checks and recovery use the same catalog interface. Writes
 require a matching table schema and do not change it automatically. Integrations
 manage platform identity, credential refresh and lineage; public Flare does not
 require a platform SDK.
+
+`src/flare` owns reusable data contracts and execution primitives.
+The exported recommendation package owns shared assembly and tuning. Private
+integration modules remain outside that export and supply transports, identity,
+and lineage through source, catalog, and publication contracts.
 
 ## Code Entrypoints and Further Reading
 

@@ -7,7 +7,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from flare.data.pipeline.production.publication.contract import PublicationIdentity
+from flare.data.contracts.publication import PublicationIdentity
 
 
 @dataclass(frozen=True, slots=True)

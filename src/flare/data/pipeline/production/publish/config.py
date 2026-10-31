@@ -12,9 +12,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from .partitioning import validate_partition_defaults
 from .resource_profile import (
     StageTopologyPlanner,
     StreamingMemoryPlanner,
+    WorkerMemoryCapacityError,
     WorkerMemoryPlanner,
 )
 
@@ -68,6 +70,7 @@ class PipelineConfig:
     source_files_per_task: int
     actor_max_tasks_in_flight: int
     encoded_batch_target_bytes: int
+    source_partition_defaults: dict[str, str] | None = None
 
     @classmethod
     def create(
@@ -105,6 +108,7 @@ class PipelineConfig:
         datasource_prefetch_buffer_size_bytes: int | None = None,
         source_files_per_task: int = 1,
         encoded_batch_target_bytes: int = DEFAULT_ENCODED_BATCH_TARGET_BYTES,
+        source_partition_defaults: dict[str, str] | None = None,
     ) -> PipelineConfig:
         """Create config from cluster resources via :class:`StageTopologyPlanner`.
 
@@ -313,7 +317,7 @@ class PipelineConfig:
             // 4
         )
         if encoded_batch_target_bytes > actor_memory_limit:
-            raise ValueError(
+            raise WorkerMemoryCapacityError(
                 "encoded_batch_target_bytes exceeds the per-actor safety limit: "
                 f"{encoded_batch_target_bytes} > {actor_memory_limit}"
             )
@@ -352,4 +356,7 @@ class PipelineConfig:
             source_files_per_task=source_files_per_task,
             actor_max_tasks_in_flight=actor_max_tasks_in_flight,
             encoded_batch_target_bytes=encoded_batch_target_bytes,
+            source_partition_defaults=validate_partition_defaults(
+                source_partition_defaults
+            ),
         )

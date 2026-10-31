@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from flare.data.contracts.publication import PublicationProtocol
 from flare.data.contracts.sink import SinkResult
-from flare.data.pipeline.production.publication.contract import PublicationProtocol
 from flare.data.pipeline.production.publish.runner import (
     discover_publication_manifest,
     publish_manifest,

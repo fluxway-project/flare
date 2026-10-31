@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 
 import pyarrow as pa
 
-from flare.data.pipeline.production.builder.constants import NULL_FID_SENTINEL
+from flare.data.contracts.constants import NULL_FID_SENTINEL
 from flare.data.schema.feature_catalog import (
     FeatureCatalog,
     FeatureOutputKind,

@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pytest
 
+from flare.data.contracts.publication import PublicationProtocol
 from flare.data.pipeline.production.builder.hdfs_source import HdfsPartitionCursor
 from flare.data.pipeline.production.builder.resume_state_manager import (
     ResumeStateManager,
 )
-from flare.data.pipeline.production.publication.contract import PublicationProtocol
 
 
 def test_in_flight_files_are_not_pending(tmp_path: Path) -> None:

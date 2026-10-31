@@ -11,8 +11,11 @@ from flare.data.connectors.adapters.iceberg.access import (
     IcebergCatalogProvider,
     IcebergTableSession,
 )
-from flare.data.pipeline.production.publication.contract import (
-    PUBLICATION_ID_PROPERTY,
+from flare.data.connectors.adapters.iceberg.publication import (
+    snapshot_added_records,
+    snapshot_publication_id,
+)
+from flare.data.contracts.publication import (
     validate_publication_id,
 )
 
@@ -112,26 +115,13 @@ def _observe_committed_snapshot(
         or snapshot_id <= 0
     ):
         raise ValueError("Iceberg snapshot has an invalid snapshot id")
-    summary = getattr(snapshot, "summary", None)
-    if summary is None:
-        raise ValueError("Iceberg snapshot has no summary after write")
-    summary_get = getattr(summary, "get", None)
-    if not callable(summary_get):
-        raise TypeError("Iceberg snapshot summary must support key lookup")
-    actual_publication_id = summary_get(PUBLICATION_ID_PROPERTY)
+    actual_publication_id = snapshot_publication_id(snapshot, required=False)
     if actual_publication_id != publication_id:
         raise RuntimeError(
             "Iceberg current snapshot publication id mismatch: "
             f"expected={publication_id!r} actual={actual_publication_id!r}"
         )
-    added_records = summary_get("added-records")
-    if added_records is None:
-        raise ValueError("Iceberg snapshot summary missing 'added-records' after write")
-    if isinstance(added_records, bool) or not isinstance(added_records, (str, int)):
-        raise TypeError("Iceberg added-records must be an integer or integer string")
-    added_records = int(added_records)
-    if added_records < 0:
-        raise ValueError("Iceberg snapshot added-records must not be negative")
+    added_records = snapshot_added_records(snapshot)
     if include_file_layout:
         raise RuntimeError(
             "Iceberg file layout observation requires the immutable append index; "

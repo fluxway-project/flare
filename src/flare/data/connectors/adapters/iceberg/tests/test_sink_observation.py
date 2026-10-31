@@ -15,13 +15,14 @@ from flare.data.connectors.adapters.iceberg.observation import (
     IcebergFileLayout,
 )
 from flare.data.connectors.adapters.iceberg.sink import IcebergSnapshotPublisher
-from flare.data.contracts.sink import PublicationIdentity
+from flare.data.contracts.publication import PublicationIdentity
 
 
 def _publisher(*, observe_file_layout: bool) -> IcebergSnapshotPublisher:
     publisher = object.__new__(IcebergSnapshotPublisher)
     publisher._table = object()
     publisher._writer_target_size_bytes = 128
+    publisher._writer_min_rows_per_task = None
     publisher._snapshot_properties = {}
     publisher._catalog_kwargs = {
         "name": "catalog",

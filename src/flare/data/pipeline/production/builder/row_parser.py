@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from flare.data.pipeline.production.builder.constants import (
+from flare.data.contracts.constants import (
     DEFAULT_FLOAT_NULL_SENTINEL,
     DEFAULT_NULL_SENTINEL,
 )
@@ -98,7 +98,9 @@ class RowParser:
 
         bufs = col.buffers()
         offsets_dtype = np.int64 if pa.types.is_large_string(col.type) else np.int32
-        offsets = np.frombuffer(bufs[1], dtype=offsets_dtype)[: n_rows + 1]
+        offsets = np.frombuffer(bufs[1], dtype=offsets_dtype)[
+            col.offset : col.offset + n_rows + 1
+        ]
         if offsets_dtype == np.int32:
             offsets = offsets.astype(np.int64)
         data_buf = bufs[2]

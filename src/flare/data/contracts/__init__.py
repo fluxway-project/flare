@@ -7,13 +7,9 @@ from flare.data.contracts.pipeline import (
     SentinelConfig,
     StageConfig,
 )
+from flare.data.contracts.publication import PublicationIdentity
 from flare.data.contracts.schema import SchemaContract
-from flare.data.contracts.sink import (
-    PublicationIdentity,
-    SinkResult,
-    StreamingSink,
-    TransactionalSink,
-)
+from flare.data.contracts.sink import SinkResult, StreamingSink, TransactionalSink
 from flare.data.contracts.transform import (
     BatchTransform,
     TransformContext,

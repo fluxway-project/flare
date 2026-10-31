@@ -24,12 +24,12 @@ from typing import Any
 
 from pyarrow import fs
 
-from flare.data.pipeline.production.builder.hdfs_source import HdfsPartitionCursor
-from flare.data.pipeline.production.publication.contract import (
+from flare.data.contracts.publication import (
     PublicationLease,
     PublicationProtocol,
     validate_publication_id,
 )
+from flare.data.pipeline.production.builder.hdfs_source import HdfsPartitionCursor
 
 logger = logging.getLogger(__name__)
 

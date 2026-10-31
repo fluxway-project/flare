@@ -19,14 +19,14 @@ from flare.data.connectors.adapters.iceberg.table import (
     DEFAULT_WRITER_TARGET_SIZE_BYTES,
 )
 from flare.data.connectors.adapters.parquet.sink import ParquetDatasetPublisher
-from flare.data.pipeline.production.builder.hdfs_source import iter_hdfs_file_paths
-from flare.data.pipeline.production.builder.resume_state_manager import (
-    ResumeStateManager,
-)
-from flare.data.pipeline.production.publication.contract import (
+from flare.data.contracts.publication import (
     PublicationPendingStore,
     PublicationProgressReporter,
     PublicationProtocol,
+)
+from flare.data.pipeline.production.builder.hdfs_source import iter_hdfs_file_paths
+from flare.data.pipeline.production.builder.resume_state_manager import (
+    ResumeStateManager,
 )
 from flare.data.pipeline.production.publication.manifest import PublicationManifest
 from flare.data.pipeline.production.publication.session import (
@@ -154,25 +154,33 @@ def _build_output_publisher(
     args: Any,
     catalog_provider: IcebergCatalogProvider | None,
     pipeline: Any,
+    *,
+    snapshot_properties: dict[str, str] | None = None,
 ) -> Any:
+    if args.output_format not in {"parquet", "iceberg"}:
+        raise ValueError(f"unsupported output format: {args.output_format!r}")
+    if args.output_format == "iceberg" and catalog_provider is None:
+        raise ValueError("Iceberg output requires a catalog provider")
+    target_size_bytes = _resolve_writer_target_size_bytes(args)
+    target_rows = max(
+        1, target_size_bytes // estimate_arrow_row_bytes(pipeline.output_schema)
+    )
     if args.output_format == "parquet":
-        target_size_bytes = _resolve_writer_target_size_bytes(args)
-        row_bytes = estimate_arrow_row_bytes(pipeline.output_schema)
+        if snapshot_properties:
+            raise ValueError("Snapshot properties require Iceberg output")
         return ParquetDatasetPublisher(
             args.output,
-            max_rows_per_file=max(1, target_size_bytes // row_bytes),
+            max_rows_per_file=target_rows,
             overwrite=getattr(args, "overwrite", False),
         )
-    if args.output_format != "iceberg":
-        raise ValueError(f"unsupported output format: {args.output_format!r}")
-    if catalog_provider is None:
-        raise ValueError("Iceberg output requires a catalog provider")
     return IcebergSnapshotPublisher(
         table_identifier=args.output,
         catalog_provider=catalog_provider,
         write_task_num_cpus=pipeline.config.write_task_num_cpus,
         write_concurrency=pipeline.config.write_concurrency,
-        writer_target_size_bytes=_resolve_writer_target_size_bytes(args),
+        writer_target_size_bytes=target_size_bytes,
+        writer_min_rows_per_task=target_rows,
+        snapshot_properties=snapshot_properties,
         observe_file_layout=args.iceberg_commit_layout_observation,
     )
 

@@ -13,8 +13,8 @@ from flare.data.connectors.adapters.iceberg.table import (
     PARQUET_COMPRESSION,
     PARQUET_VERSION,
 )
+from flare.data.contracts.publication import PublicationProtocol
 from flare.data.contracts.sink import SinkResult
-from flare.data.pipeline.production.publication.contract import PublicationProtocol
 from flare.data.pipeline.production.publish.partitioning import (
     parquet_partition_directory,
     require_partition_fields,

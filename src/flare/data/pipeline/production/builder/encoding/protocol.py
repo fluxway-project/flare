@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from flare.data.pipeline.production.builder.constants import NULL_FID_SENTINEL
+from flare.data.contracts.constants import NULL_FID_SENTINEL
 from flare.data.schema.feature_catalog import FeatureOutputKind
 
 SLOT_BITS_U64 = 48

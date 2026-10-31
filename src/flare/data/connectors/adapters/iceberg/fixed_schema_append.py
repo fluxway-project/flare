@@ -13,11 +13,17 @@ from typing import Any
 import pyarrow as pa
 from ray.data import SaveMode
 from ray.data._internal.datasource.iceberg_datasink import IcebergDatasink
+from ray.data.block import BlockAccessor
 
 from flare.data.connectors.adapters.iceberg.access import (
     IcebergCatalogProvider,
     IcebergTableSession,
 )
+from flare.data.connectors.adapters.iceberg.publication import (
+    index_publication_snapshots,
+    snapshot_added_records,
+)
+from flare.data.contracts.publication import PUBLICATION_ID_PROPERTY
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,8 @@ class FixedSchemaAppendIcebergDatasink(IcebergDatasink):
         expected_schema: pa.Schema,
         expected_iceberg_schema: Any,
         catalog_provider: IcebergCatalogProvider,
+        coalesce_target_bytes: int | None = None,
+        min_rows_per_write: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -75,6 +83,37 @@ class FixedSchemaAppendIcebergDatasink(IcebergDatasink):
         self._expected_schema = expected_schema
         self._expected_iceberg_schema = expected_iceberg_schema
         self._catalog_provider = catalog_provider
+        if coalesce_target_bytes is not None and coalesce_target_bytes <= 0:
+            raise ValueError("coalesce_target_bytes must be positive")
+        self._coalesce_target_bytes = coalesce_target_bytes
+        if min_rows_per_write is not None and min_rows_per_write <= 0:
+            raise ValueError("min_rows_per_write must be positive")
+        self._min_rows_per_write = min_rows_per_write
+
+    @property
+    def min_rows_per_write(self) -> int | None:
+        return self._min_rows_per_write
+
+    def _coalesced_blocks(self, blocks):
+        """Zero-copy bundling within a write task; Iceberg retains partition routing."""
+        if self._coalesce_target_bytes is None:
+            yield from blocks
+            return
+        pending = []
+        pending_bytes = 0
+        for block in blocks:
+            table = BlockAccessor.for_block(block).to_arrow()
+            require_fixed_output_schemas([table.schema], self._expected_schema)
+            if not table.num_rows:
+                continue
+            if pending and pending_bytes + table.nbytes > self._coalesce_target_bytes:
+                yield pa.concat_tables(pending)
+                pending = []
+                pending_bytes = 0
+            pending.append(table)
+            pending_bytes += table.nbytes
+        if pending:
+            yield pa.concat_tables(pending)
 
     def __getstate__(self) -> dict:
         state = super().__getstate__()
@@ -109,7 +148,7 @@ class FixedSchemaAppendIcebergDatasink(IcebergDatasink):
 
     def write(self, blocks, ctx):
         with self._table_scope():
-            return super().write(blocks, ctx)
+            return super().write(self._coalesced_blocks(blocks), ctx)
 
     def on_write_complete(self, write_result: Any) -> None:
         with self._table_scope():
@@ -141,15 +180,23 @@ class FixedSchemaAppendIcebergDatasink(IcebergDatasink):
             "[on_write_complete] Fixed-schema validation used %d distinct schema objects",
             len({id(schema) for schema in all_schemas}),
         )
-        # Compare canonical Iceberg schemas, not Arrow projections: Iceberg may
-        # expose a semantically compatible Arrow ``large_list`` where pipeline
-        # output uses ``list``.  The publisher's preflight returned this exact
-        # canonical schema; a changed table at commit time must fail rather than
-        # silently evolve or reconcile it.
-        if self._table.schema() != self._expected_iceberg_schema:
-            raise RuntimeError(
-                "Iceberg table schema differs from the validated Iceberg schema"
-            )
+        publication_id = self._snapshot_properties.get(PUBLICATION_ID_PROPERTY)
+        if publication_id is not None:
+            committed = index_publication_snapshots(
+                self._table.snapshots(), require_publication_ids=False
+            ).get(publication_id)
+            if committed is not None:
+                if snapshot_added_records(committed) != sum(
+                    file.record_count for file in all_data_files
+                ):
+                    raise RuntimeError(
+                        "Repeated publication has a different record count"
+                    )
+                logger.info(
+                    "Publication %s is already committed; skipping append",
+                    publication_id,
+                )
+                return
         transaction = self._table.transaction()
         logger.info(
             "[on_write_complete] Starting fixed-schema APPEND commit for %d data files ...",

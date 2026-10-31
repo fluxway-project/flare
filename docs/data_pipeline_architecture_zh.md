@@ -94,11 +94,29 @@ sequenceDiagram
 ## 外部来源与 Catalog 会话
 
 `PartitionedSourceProvider` 提供目录列举和文件读取；`IcebergCatalogProvider`
-提供表访问。driver 和 worker 各自打开、关闭会话，不共享已打开的连接。
+提供表访问。驱动进程和工作进程各自打开、关闭会话，不共享已打开的连接。
 普通 Iceberg 配置使用 `ConfiguredIcebergCatalogProvider`。
 
-发布、快照检查和恢复使用同一套 Catalog 接口。写入要求表 schema 匹配，不自动修改
+未注入来源 provider 时，目录发现和读取使用 PyArrow 按 URI 选择的标准文件系统。
+自定义网关发现、认证协议及部署身份属于外部 provider，公共数据层不通过环境变量
+选择某个部署的接入模式。增加来源实现只需实现并注入现有协议。
+
+分区缺省值通过 `source_partition_defaults` 显式传入；公共层不设业务默认值。
+Iceberg 格式适配器接收显式的写入行数提示和字节合并目标，不解释模型特征元数据；
+需要根据特征行宽估算批次的生产端在装配时计算并注入提示。
+
+Iceberg 的发布标识索引与记录数校验集中在格式适配器的 `publication` 模块，
+写入、恢复及集成层报告共用同一套规则。HTTP 重试、连接池和保活策略集中在
+`flare.io.http`；来源适配器只负责自己的协议与会话生命周期。
+
+发布值对象和协议统一定义在 `flare.data.contracts.publication`，共享哨兵值统一定义
+在 `flare.data.contracts.constants`。契约层与格式适配器不导入生产执行实现或应用配置。
+
+发布、快照检查和恢复使用同一套目录接口。写入要求表结构匹配，不自动修改
 表结构。平台身份、凭据刷新及血缘由集成方管理，公共 Flare 无需安装平台 SDK。
+
+`src/flare` 负责通用数据契约和执行原语，导出的推荐组件负责共享装配与调优。
+私有集成模块不进入公开导出，通过来源、目录及发布契约提供传输、身份和血缘实现。
 
 ## 代码入口与后续阅读
 

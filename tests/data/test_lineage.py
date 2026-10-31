@@ -14,9 +14,9 @@ from flare.data.contracts.lineage import (
     LineageContext,
     OutputPublished,
 )
+from flare.data.contracts.publication import PublicationIdentity
 from flare.data.contracts.sink import SinkResult
 from flare.data.pipeline.lineage import LineageRecorder
-from flare.data.pipeline.production.publication.contract import PublicationIdentity
 
 
 class Exporter:

@@ -1,21 +1,19 @@
-"""Streaming HDFS reader via WebHDFS HTTP API, zero disk I/O.
+"""Native filesystem discovery and resumable HTTP streams.
 
-Replicates the network logic inside dfs.sh in Python:
-  1. GET /api/oneservice/getOneHealthyInstance  → picks a live datanode ip:port
-  2. GET ...&op=LISTSTATUS                      → lists directory entries
-  3. GET ...&op=OPEN                            → streams raw file bytes
-
-The byte stream is decompressed on-the-fly with zstandard.
+Filesystem URIs use PyArrow's standard filesystem implementations. Custom
+transports supply source providers or explicit listing/URL resolver callbacks;
+no deployment-specific gateway discovery or authentication is performed here.
 """
 
 import concurrent.futures
 import glob
 import io
+import itertools
 import logging
 import os
+import posixpath
 import random
 import re
-import socket
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator, Mapping
@@ -24,49 +22,12 @@ from datetime import date, timedelta
 
 import requests
 import urllib3
-from requests.adapters import HTTPAdapter
-from urllib3.connection import HTTPConnection
-from urllib3.util.retry import Retry
+
+from flare.io.http import get_process_http_session
 
 logger = logging.getLogger(__name__)
 
 
-def _build_keepalive_socket_options() -> list:
-    """
-    Build socket options enabling TCP keepalive so middleboxes / WebHDFS gateways
-    do not silently reap long-lived streaming connections during decompression.
-    Linux-only options (TCP_KEEPIDLE/INTVL/CNT) are added best-effort.
-    """
-    opts = list(HTTPConnection.default_socket_options) + [
-        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-    ]
-    for name, value in (
-        ("TCP_KEEPIDLE", 60),
-        ("TCP_KEEPINTVL", 30),
-        ("TCP_KEEPCNT", 3),
-    ):
-        const = getattr(socket, name, None)
-        if const is not None:
-            opts.append((socket.IPPROTO_TCP, const, value))
-    return opts
-
-
-class _KeepAliveAdapter(HTTPAdapter):
-    """HTTPAdapter that enables TCP SO_KEEPALIVE on every pooled connection."""
-
-    _SOCKET_OPTIONS = _build_keepalive_socket_options()
-
-    def init_poolmanager(self, *args, **kwargs):
-        kwargs["socket_options"] = self._SOCKET_OPTIONS
-        return super().init_poolmanager(*args, **kwargs)
-
-    def proxy_manager_for(self, *args, **kwargs):
-        kwargs["socket_options"] = self._SOCKET_OPTIONS
-        return super().proxy_manager_for(*args, **kwargs)
-
-
-_CONNECT_TIMEOUT_S = 30
-_READ_TIMEOUT_S = 600
 _STREAM_CHUNK = 4 << 20  # 4 MiB — 减少 syscall 次数，提升解压吞吐
 
 
@@ -177,42 +138,6 @@ def _observations_fingerprint(
     )
 
 
-def _get_retry_session(max_retries=5, backoff_factor=1.0) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=max_retries,
-        read=max_retries,
-        connect=max_retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=[500, 502, 503, 504],
-    )
-    adapter = _KeepAliveAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-# Per-process Session cache.
-#
-# Holding a requests.Session at module scope is unsafe under fork-based
-# multiprocessing: sockets sitting in the parent's connection pool would be
-# inherited by every child Ray actor and the first request could fail with
-# 'Bad file descriptor' / 'Connection reset' as siblings race on the same
-# fd. Keying the cache by PID forces each actor process to lazily build its
-# own Session on first use, while still reusing it within the process.
-_SESSION_PID: int | None = None
-_SESSION: requests.Session | None = None
-
-
-def _get_session() -> requests.Session:
-    global _SESSION, _SESSION_PID
-    pid = os.getpid()
-    if _SESSION is None or _SESSION_PID != pid:
-        _SESSION = _get_retry_session()
-        _SESSION_PID = pid
-    return _SESSION
-
-
 def _normalize_hdfs_path(path: str) -> str:
     if path.startswith("hdfs://"):
         scheme = "hdfs://"
@@ -223,103 +148,51 @@ def _normalize_hdfs_path(path: str) -> str:
     return scheme + re.sub(r"//+", "/", rest)
 
 
-def _full_path(path: str) -> str:
-    # Strip any hdfs://<authority> prefix so we always emit a bare absolute
-    # path — WebHDFS only needs the absolute path, the namespace authority is redundant.
-    # the absolute path, the namespace authority is redundant here.
-    if path.startswith("hdfs://"):
-        rest = path[len("hdfs://") :]
-        slash = rest.find("/")
-        path = rest[slash:] if slash != -1 else "/"
-    if not path.startswith("/"):
-        path = "/" + path
-    return _normalize_hdfs_path(path)
+def open_hdfs_file(path: str):
+    """Open a file using the native filesystem selected by its URI."""
+    from pyarrow import fs
 
-
-def _user_passwd(hdfs_path: str) -> tuple[str, str]:
-    """Read credentials supplied by the deployment, never from public code."""
-    del hdfs_path
-    user = os.environ.get("FLARE_HDFS_USER")
-    password = os.environ.get("FLARE_HDFS_PASSWORD")
-    if not user or not password:
-        raise RuntimeError(
-            "FLARE_HDFS_USER and FLARE_HDFS_PASSWORD are required for WebHDFS"
-        )
-    return user, password
-
-
-def _base_url(hdfs_path: str) -> str:
-    """
-    Calls the gateway to obtain a healthy datanode, returns the whdfs base URL.
-    Mirrors dfs.sh::make_url().
-    """
-    gateway = os.environ.get("FLARE_HDFS_GATEWAY")
-    if not gateway:
-        raise RuntimeError("FLARE_HDFS_GATEWAY is required for WebHDFS")
-    user, passwd = _user_passwd(hdfs_path)
-    query = urllib.parse.urlencode({"user": user, "password": passwd})
-    gateway = f"{gateway.rstrip('/')}/api/oneservice/getOneHealthyInstance?{query}"
-    resp = _get_session().get(gateway, timeout=_CONNECT_TIMEOUT_S)
-    resp.raise_for_status()
-    ipport = resp.text.strip()
-    if not ipport:
-        raise RuntimeError(f"Empty datanode response from gateway for {hdfs_path}")
-    return f"http://{ipport}/api/oneservice/whdfs?{query}&retryCount=1"
+    filesystem, native_path = fs.FileSystem.from_uri(path)
+    return filesystem.open_input_file(native_path)
 
 
 def hdfs_ls(hdfs_dir: str) -> list[str]:
-    """
-    List direct children of an HDFS directory.
-    Returns full absolute HDFS paths.
-    Mirrors dfs.sh::ls_hdfs().
-    """
-    full = _full_path(hdfs_dir)
-    url = f"{_base_url(full)}&path={full}&op=LISTSTATUS&useAcls=false"
-    resp = _get_session().get(url, timeout=_CONNECT_TIMEOUT_S)
-    resp.raise_for_status()
-    entries = resp.json().get("FileStatuses", {}).get("FileStatus", [])
-    return [f"{full}/{e['pathSuffix']}" for e in entries if e.get("pathSuffix")]
+    """List direct children through the URI's native filesystem."""
+    return [item.path for item in hdfs_list_status(hdfs_dir)]
 
 
 def hdfs_list_status(hdfs_dir: str) -> tuple[HdfsFileObservation, ...]:
-    """Read HDFS namespace metadata without opening any file."""
-    full = _full_path(hdfs_dir)
-    if os.path.exists(full):
-        observations = []
-        for entry in os.scandir(full):
-            stat = entry.stat()
-            observations.append(
-                HdfsFileObservation(
-                    path=entry.path,
-                    length=0 if entry.is_dir() else int(stat.st_size),
-                    modification_time_ms=int(stat.st_mtime_ns // 1_000_000),
-                    is_directory=entry.is_dir(),
-                )
+    """Read native filesystem metadata without opening any data file."""
+    from pyarrow import fs
+
+    filesystem, native_path = fs.FileSystem.from_uri(hdfs_dir)
+    entries = filesystem.get_file_info(fs.FileSelector(native_path, recursive=False))
+    parsed = urllib.parse.urlsplit(hdfs_dir)
+    observations = []
+    for entry in entries:
+        path = entry.path
+        if parsed.scheme:
+            relative = posixpath.relpath(entry.path, native_path)
+            path = hdfs_dir.rstrip("/") + "/" + urllib.parse.quote(relative, safe="/")
+        is_directory = entry.type == fs.FileType.Directory
+        observations.append(
+            HdfsFileObservation(
+                path=path,
+                length=0 if is_directory else entry.size,
+                modification_time_ms=(entry.mtime_ns or 0) // 1_000_000,
+                is_directory=is_directory,
             )
-        return tuple(sorted(observations, key=lambda item: item.path))
-    url = f"{_base_url(full)}&path={full}&op=LISTSTATUS&useAcls=false"
-    resp = _get_session().get(url, timeout=_CONNECT_TIMEOUT_S)
-    resp.raise_for_status()
-    entries = resp.json().get("FileStatuses", {}).get("FileStatus", [])
-    return tuple(
-        HdfsFileObservation(
-            path=f"{full}/{entry['pathSuffix']}",
-            length=int(entry.get("length", 0)),
-            modification_time_ms=int(entry.get("modificationTime", 0)),
-            is_directory=str(entry.get("type", "FILE")).upper() == "DIRECTORY",
         )
-        for entry in entries
-        if entry.get("pathSuffix")
-    )
+    return tuple(sorted(observations, key=lambda item: item.path))
 
 
 def hdfs_file_exists(path: str) -> bool:
-    normalized = _full_path(path)
+    normalized = _normalize_hdfs_path(path)
     parent, _, name = normalized.rpartition("/")
     if not parent or not name:
         raise ValueError(f"HDFS file path must include a parent and name: {path!r}")
     return any(
-        not item.is_directory and _full_path(item.path) == normalized
+        not item.is_directory and _normalize_hdfs_path(item.path) == normalized
         for item in hdfs_list_status(parent)
     )
 
@@ -374,12 +247,7 @@ def hdfs_ls_parallel(hdfs_dirs: list[str], max_workers: int = 24) -> list[str]:
     Any listing failure is propagated; an incomplete namespace observation must
     never be treated as a completed partition.
     """
-    all_files = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(hdfs_ls, directory) for directory in hdfs_dirs]
-        for future in concurrent.futures.as_completed(futures):
-            all_files.extend(future.result())
-    return all_files
+    return list(hdfs_ls_parallel_iter(hdfs_dirs, max_workers=max_workers))
 
 
 def hdfs_ls_parallel_iter(
@@ -422,7 +290,6 @@ class ResilientWebHdfsReader(io.RawIOBase):
         self.bytes_read = 0
         self.resp = None
         self.stream = None
-        self._open_stream()
 
     def readable(self) -> bool:
         return True
@@ -456,7 +323,7 @@ class ResilientWebHdfsReader(io.RawIOBase):
         else:
             logger.info("Opening HDFS stream for %s", self.hdfs_file)
 
-        self.resp = _get_session().get(
+        self.resp = get_process_http_session().get(
             url, stream=True, timeout=(self.connect_timeout, self.read_timeout)
         )
         self.resp.raise_for_status()
@@ -515,29 +382,32 @@ class ResilientWebHdfsReader(io.RawIOBase):
                         and status not in self._RETRIABLE_4XX
                     ):
                         logger.error(
-                            "Non-retriable HTTP %d for HDFS stream %s at offset %d: %s",
+                            "Non-retriable HTTP %d for HDFS stream %s at offset %d",
                             status,
                             self.hdfs_file,
                             self.bytes_read,
-                            e,
                         )
-                        raise
+                        raise RuntimeError(
+                            f"HDFS stream rejected with HTTP {status}: {self.hdfs_file}"
+                        ) from None
 
                 retries += 1
                 if retries > self.max_retries:
                     logger.error(
-                        "Max retries exceeded for HDFS stream %s at offset %d: %s",
+                        "Max retries exceeded for HDFS stream %s at offset %d (%s)",
                         self.hdfs_file,
                         self.bytes_read,
-                        e,
+                        type(e).__name__,
                     )
-                    raise
+                    raise RuntimeError(
+                        f"HDFS stream failed after {self.max_retries} retries: "
+                        f"{self.hdfs_file} ({type(e).__name__})"
+                    ) from None
                 logger.warning(
-                    "Network error during HDFS stream read for %s at offset %d. Error type: %s, Message: %s. Retrying (%d/%d)...",
+                    "Network error during HDFS stream read for %s at offset %d (%s). Retrying (%d/%d)...",
                     self.hdfs_file,
                     self.bytes_read,
                     type(e).__name__,
-                    e,
                     retries,
                     self.max_retries,
                 )
@@ -560,7 +430,6 @@ class ResilientWebHdfsReader(io.RawIOBase):
 def collect_hdfs_file_paths(hdfs_root: str, start: date, end: date) -> list[str]:
     """
     Enumerate all part-*.zst files on HDFS for the given date range.
-    Mirrors the nested loop logic in pull_data.sh.
     """
     return list(iter_hdfs_file_paths(hdfs_root, start, end))
 
@@ -581,7 +450,10 @@ def iter_hdfs_file_paths(
             date_dir = os.path.join(hdfs_root, f"ds={d.isoformat()}")
             if os.path.exists(date_dir):
                 for f in sorted(
-                    glob.iglob(os.path.join(date_dir, "hour=*", "part-*.zst"))
+                    itertools.chain(
+                        glob.iglob(os.path.join(date_dir, "part-*.zst")),
+                        glob.iglob(os.path.join(date_dir, "hour=*", "part-*.zst")),
+                    )
                 ):
                     yield f
             d += timedelta(days=1)
@@ -590,7 +462,13 @@ def iter_hdfs_file_paths(
     list_directory = hdfs_ls if list_directory is None else list_directory
     while d <= end:
         date_dir = f"{hdfs_root}/ds={d.isoformat()}"
-        hour_dirs = sorted(list_directory(date_dir))
+        entries = sorted(list_directory(date_dir))
+        yield from (
+            f
+            for f in entries
+            if f.rsplit("/", 1)[-1].startswith("part-") and f.endswith(".zst")
+        )
+        hour_dirs = [f for f in entries if f.rsplit("/", 1)[-1].startswith("hour=")]
         for f in hdfs_ls_parallel_iter(
             hour_dirs, max_workers=24, list_directory=list_directory
         ):

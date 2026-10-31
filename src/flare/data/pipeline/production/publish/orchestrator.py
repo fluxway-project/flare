@@ -177,6 +177,7 @@ class RayDataPipeline:
             )
 
         datasource = HdfsZstdDatasource(
+            source_partition_defaults=self._config.source_partition_defaults,
             source_provider=self._source_provider,
             file_paths=file_paths,
             source_csv_block_size_bytes=self._config.source_csv_block_size_bytes,

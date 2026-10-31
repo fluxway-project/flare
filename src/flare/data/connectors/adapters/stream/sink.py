@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Literal
 
 import pyarrow as pa
 
+from flare.data.contracts.publication import PublicationProtocol
 from flare.data.contracts.sink import SinkResult
-from flare.data.pipeline.production.publication.contract import PublicationProtocol
 
 if TYPE_CHECKING:
     import ray.data

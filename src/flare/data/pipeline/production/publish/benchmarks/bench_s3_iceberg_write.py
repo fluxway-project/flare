@@ -9,7 +9,7 @@ from flare.data.connectors.adapters.iceberg.access import (
 )
 from flare.data.connectors.adapters.iceberg.catalog import build_iceberg_catalog_kwargs
 from flare.data.connectors.adapters.iceberg.sink import IcebergSnapshotPublisher
-from flare.data.contracts.sink import PublicationIdentity
+from flare.data.contracts.publication import PublicationIdentity
 from flare.data.pipeline.production.publish.resource_profile import (
     DEFAULT_WRITE_TASK_NUM_CPUS,
 )

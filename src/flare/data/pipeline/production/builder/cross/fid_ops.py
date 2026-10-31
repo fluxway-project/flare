@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from numba.typed import List
 
-from flare.data.pipeline.production.builder.constants import (
+from flare.data.contracts.constants import (
     ARRAY_FEATURE_MAX_LENGTH,
     NULL_FID_SENTINEL,
 )

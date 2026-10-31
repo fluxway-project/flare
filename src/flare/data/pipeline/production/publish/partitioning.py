@@ -28,7 +28,25 @@ def require_partition_fields(schema: pa.Schema) -> tuple[pa.Field, ...]:
     return fields
 
 
-def source_partition_values(path: str) -> dict[str, str]:
+def _require_partition_value(name: str, value: str) -> None:
+    if not isinstance(value, str) or not value or "/" in value or "\\" in value:
+        raise ValueError(f"invalid partition value {name}={value!r}")
+
+
+def validate_partition_defaults(defaults: dict[str, str] | None) -> dict[str, str]:
+    values = dict(defaults or {})
+    unknown = set(values) - set(PARTITION_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown partition default columns: {sorted(unknown)}")
+    for name, value in values.items():
+        _require_partition_value(name, value)
+    return values
+
+
+def source_partition_values(
+    path: str, *, defaults: dict[str, str] | None = None
+) -> dict[str, str]:
+    defaults = validate_partition_defaults(defaults)
     segments = path.replace("\\", "/").split("/")
     values: dict[str, str] = {}
     for column, source_name in _SOURCE_SEGMENTS.items():
@@ -36,6 +54,9 @@ def source_partition_values(path: str) -> dict[str, str]:
         matches = [
             segment[len(prefix) :] for segment in segments if segment.startswith(prefix)
         ]
+        if not matches and column in defaults:
+            values[column] = defaults[column]
+            continue
         if len(matches) != 1 or not matches[0]:
             raise ValueError(
                 f"source path must contain exactly one non-empty {source_name}= partition: {path}"
@@ -52,7 +73,6 @@ def parquet_partition_directory(
         raise ValueError("partition values do not match the partition contract")
     directory = root
     for name, value in zip(PARTITION_COLUMNS, values, strict=True):
-        if not value or "/" in value or "\\" in value:
-            raise ValueError(f"invalid Parquet partition value {name}={value!r}")
+        _require_partition_value(name, value)
         directory /= f"{name}={value}"
     return directory

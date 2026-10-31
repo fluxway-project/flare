@@ -5,13 +5,9 @@ from dataclasses import dataclass
 import pyarrow as pa
 import pytest
 
+from flare.data.contracts.publication import PublicationIdentity
 from flare.data.contracts.schema import SchemaContract
-from flare.data.contracts.sink import (
-    PublicationIdentity,
-    SinkResult,
-    StreamingSink,
-    TransactionalSink,
-)
+from flare.data.contracts.sink import SinkResult, StreamingSink, TransactionalSink
 from flare.data.contracts.transform import (
     BatchTransform,
     TransformContext,

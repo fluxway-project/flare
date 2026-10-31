@@ -1,4 +1,4 @@
-from flare.data.pipeline.production.builder.constants import DEFAULT_NULL_SENTINEL
+from flare.data.contracts.constants import DEFAULT_NULL_SENTINEL
 
 from ..encoding.base import EncoderExpr
 from ..encoding.sparse_id import HashEncoderExpr

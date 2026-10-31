@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from flare.data.execution.plan.terminal import DatasetTerminal
-from flare.data.pipeline.production.publication.contract import (
+from flare.data.contracts.publication import (
     PublicationLeaseStore,
     PublicationProtocol,
     PublicationResult,
 )
+from flare.data.execution.plan.terminal import DatasetTerminal
 from flare.data.pipeline.production.publication.manifest import PublicationManifest
 
 
