@@ -71,9 +71,14 @@ class CpuNumbaSparseEmbeddingOperator(SparseEmbeddingOperator):
         if hasattr(value, "__jax_array__") or (
             hasattr(value, "__class__") and "jax" in value.__class__.__module__
         ):
-            import numpy as np
-
             value = np.asarray(value)
+        # HybridBackend's explicit CPU conversion rebuilds arrays through
+        # ``__array_interface__``; NumPy reports BF16 there as ``V2`` and
+        # loses the logical dtype. Numba only reads this transport buffer, so
+        # keep its existing host view intact until the precision boundary
+        # validates and promotes it to the native scatter dtype.
+        if isinstance(value, np.ndarray) and value.dtype.name == "bfloat16":
+            return value
         return self._backend.as_tensor(value, device="cpu")
 
     def inverse(self, value: Any) -> np.ndarray:

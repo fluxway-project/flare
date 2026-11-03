@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from collections import deque
 from dataclasses import make_dataclass
 from typing import Any
 
@@ -49,14 +51,6 @@ class TrainMetricsComputer:
             labels=labels,
             groups=groups,
         )
-
-    def compute_and_write(self, window: MetricWindow) -> dict[str, Any]:
-        per_target_metrics = (
-            self._metrics.compute(window.prediction_refs)
-            if window.prediction_refs
-            else {}
-        )
-        return self.write_metrics(window, per_target_metrics)
 
     def submit_metrics(self, refs: tuple[Any, ...]) -> Any:
         return self._metrics.submit_compute(refs)
@@ -145,13 +139,17 @@ class TrainMetricsAggregatorSPMD:
         window_steps: int = 100,
         negative_factor: float | None = None,
         target_step: int | None = None,
+        max_pending_windows: int = 0,
     ) -> None:
         if window_steps <= 0:
             raise ValueError(f"window_steps must be positive, got {window_steps}")
         if target_step is not None and target_step <= 0:
             raise ValueError(f"target_step must be positive, got {target_step}")
+        if type(max_pending_windows) is not int or max_pending_windows < 0:
+            raise ValueError("max_pending_windows must be non-negative")
         self.window_steps = int(window_steps)
         self.target_step = None if target_step is None else int(target_step)
+        self.max_pending_windows = max_pending_windows
         self._target_labels = np.asarray(target_labels, dtype=np.float32)
         self._computer = TrainMetricsComputer(
             sink=RankingTensorBoardMetricSink(log_dir),
@@ -169,13 +167,17 @@ class TrainMetricsAggregatorSPMD:
         self._trained_sample_count = 0
         self._global_step = 0
         self._window_start_time: float | None = None
+        self._pending_windows: deque[asyncio.Task[None]] = deque()
         self.TrainMetricsOutput = TrainMetricsOutput
 
     async def on_shutdown(self) -> None:
-        await self.wait_for_metrics()
-        self._computer.close()
+        try:
+            await self.wait_for_metrics()
+        finally:
+            self._computer.close()
 
     async def step(self, **kwargs: Any) -> Any:
+        self._raise_completed_window_errors()
         scores = np.asarray(transport_payload(kwargs["scores"]), dtype=np.float32)
         labels = np.asarray(transport_payload(kwargs["labels"]), dtype=np.int32)
         groups = np.asarray(transport_payload(kwargs["group_ids"]), dtype=np.int64)
@@ -238,11 +240,46 @@ class TrainMetricsAggregatorSPMD:
             should_submit = should_submit or self._global_step >= self.target_step
         if should_submit:
             await self._submit_window()
+        if self.target_step is not None and self._global_step >= self.target_step:
+            await self.wait_for_metrics()
         return self.TrainMetricsOutput()
 
     async def wait_for_metrics(self) -> None:
-        if self._step_count > 0:
-            await self._submit_window()
+        try:
+            if self._step_count > 0:
+                await self._submit_window()
+        finally:
+            await self._drain_pending_windows()
+
+    def _raise_completed_window_errors(self) -> None:
+        while self._pending_windows and self._pending_windows[0].done():
+            self._pending_windows.popleft().result()
+
+    async def _drain_pending_windows(self) -> None:
+        pending = tuple(self._pending_windows)
+        self._pending_windows.clear()
+        if not pending:
+            return
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _complete_window(
+        self,
+        window: MetricWindow,
+        metric_ref: Any | None,
+        previous: asyncio.Task[None] | None,
+        *,
+        background: bool,
+    ) -> None:
+        if previous is not None:
+            await previous
+        metrics = await metric_ref if metric_ref is not None else {}
+        if background:
+            await asyncio.to_thread(self._computer.write_metrics, window, metrics)
+        else:
+            self._computer.write_metrics(window, metrics)
 
     async def _submit_window(self) -> None:
         if self._step_count <= 0:
@@ -269,12 +306,24 @@ class TrainMetricsAggregatorSPMD:
         self._trained_sample_count = 0
         self._window_start_time = None
 
-        per_target_metrics = (
-            await self._computer.submit_metrics(window.prediction_refs)
+        if self.max_pending_windows:
+            self._raise_completed_window_errors()
+            if len(self._pending_windows) >= self.max_pending_windows:
+                await self._pending_windows.popleft()
+        metric_ref = (
+            self._computer.submit_metrics(window.prediction_refs)
             if window.prediction_refs
-            else {}
+            else None
         )
-        self._computer.write_metrics(window, per_target_metrics)
+        if self.max_pending_windows == 0:
+            await self._complete_window(window, metric_ref, None, background=False)
+            return
+        previous = self._pending_windows[-1] if self._pending_windows else None
+        self._pending_windows.append(
+            asyncio.create_task(
+                self._complete_window(window, metric_ref, previous, background=True)
+            )
+        )
 
 
 def get_train_metrics_aggregator_spmd_class(
@@ -283,6 +332,7 @@ def get_train_metrics_aggregator_spmd_class(
     runtime_env: dict[str, Any] | None,
     resource_profile: Any,
     max_inflight_steps: int,
+    driver_runtime_env: dict[str, Any] | None = None,
 ) -> type:
     if max_inflight_steps <= 0:
         raise ValueError(
@@ -296,11 +346,13 @@ def get_train_metrics_aggregator_spmd_class(
         mesh_axis_names=("dp",),
         mesh_axis_shapes=(1,),
         runtime_env=runtime_env,
+        checkpoint_components=(),
         step={
             "async_policy": AsyncPolicy.pipelined(depth=max_inflight_steps + 1),
             "input_sharding": input_sharding,
             "output_sharding": {},
         },
+        driver_runtime_env=driver_runtime_env,
     )
 
 

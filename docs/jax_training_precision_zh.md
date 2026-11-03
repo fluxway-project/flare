@@ -20,8 +20,18 @@ state_definition = NnxTrainingStateDefinition.from_model_definition(
 
 启用半精度策略时：
 - 普通 `nnx.Param` 参数在模型前向与反向计算中使用临时的 BF16/FP16 计算视图；
-- 主参数权重（Master weights）、优化器浮点状态、参数与输入梯度、分布式规约、Loss/Metrics 计算及检查点序列化均保持 FP32；
+- 主参数权重（Master weights）、优化器浮点状态、梯度累积、Loss/Metrics 计算及检查点序列化均保持 FP32；
+- BF16/FP16 训练的稠密与稀疏梯度统一使用 BF16 传输，FP32 训练仍使用 FP32 传输；
 - 非 Param 状态保持原有声明的 dtype。
+
+梯度传输精度由精度策略直接决定，无需额外开关。BF16 保留 FP32 的指数范围，
+避免 FP16 计算模式引入 FP16 传输溢出；量化和集合求和仍存在舍入误差。
+规约结果恢复 FP32 后再执行平均和优化器更新。默认边界同步模式中，
+ZeRO-1/2/3 先在本地以 FP32 累积完整的 micro-step 梯度，仅在 macro update
+边界转换并同步一次；ZeRO-2/3 的全局分片范围使用 reduce-scatter，节点内
+分片范围使用一次全局 all-reduce 后在本地切片，得到分片梯度。
+显式低显存 micro 模式则每个微步转换并规约一次。两种模式在编译后的 kernel
+内复用同一份集合通信实现。参数 all-gather 仍传输 FP32 主权重。
 
 ## 参数角色与 Embedding 边界
 

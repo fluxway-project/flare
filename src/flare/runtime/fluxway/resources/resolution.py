@@ -1,33 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from decimal import Decimal
 from typing import Literal
 
-from fluxway import ResourceProfile, ResourceScale
-
-GiB = 1024**3
-
-
-DEFAULT_ROLE_PROFILES: Mapping[str, ResourceProfile] = {
-    "reader": ResourceProfile(base={"CPU": 1, "memory": 4 * GiB}),
-    "input": ResourceProfile(base={"CPU": 2, "memory": 8 * GiB}),
-    "compute": ResourceProfile(base={"CPU": 2, "GPU": 1, "memory": 2 * GiB}),
-    "table": ResourceProfile(
-        base={"CPU": 1, "memory": GiB},
-        scale=ResourceScale(
-            step={"CPU": 1, "memory": 6 * GiB},
-            max_steps=63,
-            weight=2,
-        ),
-    ),
-    "metrics": ResourceProfile(
-        base={"CPU": Decimal("1.01"), "memory": Decimal("2.1") * GiB},
-        ray_component_limits={"CPU": Decimal(2), "memory": Decimal(2) * GiB},
-    ),
-}
-
-CPU_COMPUTE_PROFILE = ResourceProfile(base={"CPU": 2, "memory": 2 * GiB})
+from fluxway import ResourceProfile
 
 
 class ResourceProfiles:
@@ -43,9 +19,18 @@ class ResourceProfiles:
 
 def resolve_resource_profiles(
     worker_counts: Mapping[str, int],
+    role_profiles: Mapping[str, ResourceProfile],
     *,
     compute_device: Literal["cpu", "gpu"] = "gpu",
+    device_overrides: Mapping[str, Mapping[str, ResourceProfile]] | None = None,
 ) -> ResourceProfiles:
+    """Resolve application-provided role profiles for a worker layout.
+
+    Role names and their resource reservations belong to the application or
+    recipe layer.  The runtime layer only validates the layout and selects an
+    optional device-specific override, so it does not need to know about
+    reader, input, metrics, or any other application role.
+    """
     if compute_device not in {"cpu", "gpu"}:
         raise ValueError(
             f"compute_device must be 'cpu' or 'gpu', got {compute_device!r}"
@@ -57,24 +42,19 @@ def resolve_resource_profiles(
     }
     if invalid:
         raise ValueError(f"worker counts must be positive integers: {invalid}")
-    missing = sorted(set(worker_counts) - set(DEFAULT_ROLE_PROFILES) - {"driver"})
+    missing = sorted(set(worker_counts) - set(role_profiles) - {"driver"})
     if missing:
         raise KeyError(f"worker roles have no ResourceProfile: {missing}")
+    overrides = (device_overrides or {}).get(compute_device, {})
     roles = {
-        role: (
-            CPU_COMPUTE_PROFILE
-            if role == "compute" and compute_device == "cpu"
-            else DEFAULT_ROLE_PROFILES[role]
-        )
+        role: overrides.get(role, role_profiles[role])
         for role in worker_counts
-        if role in DEFAULT_ROLE_PROFILES
+        if role in role_profiles
     }
     return ResourceProfiles(roles)
 
 
 __all__ = [
-    "CPU_COMPUTE_PROFILE",
-    "DEFAULT_ROLE_PROFILES",
     "ResourceProfiles",
     "resolve_resource_profiles",
 ]

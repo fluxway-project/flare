@@ -8,6 +8,7 @@ import pytest
 from flare.kernels.backends.cpu_numba import CpuNumbaSparseEmbeddingOperator
 from flare.kernels.backends.gpu_cupy import CupySparseEmbeddingOperator
 from flare.kernels.backends.jax_backend import JaxSparseEmbeddingOperator
+from flare.runtime.sparse_precision import prepare_sparse_native_gradient
 
 
 class _Stream:
@@ -165,17 +166,32 @@ def test_cpu_scatter_exposes_declared_gradient_dtype() -> None:
     np.testing.assert_allclose(result, np.asarray([[1.5], [2.25]], dtype=np.float32))
 
 
-def test_cpu_scatter_promotes_bfloat16_transport_to_native_fp32() -> None:
+def test_cpu_bfloat16_transport_survives_native_scatter_boundary() -> None:
+    backend = CpuNumbaSparseEmbeddingOperator(
+        value_dtype="float16", gradient_dtype="float32"
+    )
+    inverse = np.asarray([0, 1], dtype=np.int32)
+    gradient = jax.numpy.asarray([[1.5], [2.25]], dtype=jax.numpy.bfloat16)
+    transported = backend.local_array(gradient)
+    assert transported.dtype == np.dtype("bfloat16")
+    native = prepare_sparse_native_gradient(
+        transported, transport_dtype="bfloat16", native_dtype="float32"
+    )
+    result = backend.scatter(2, 1, inverse, 2, native)
+    assert result.dtype == np.float32
+    np.testing.assert_allclose(result, np.asarray([[1.5], [2.25]], dtype=np.float32))
+
+
+def test_cpu_array_preserves_bfloat16_host_dtype() -> None:
     import ml_dtypes
 
     backend = CpuNumbaSparseEmbeddingOperator(
         value_dtype="float16", gradient_dtype="float32"
     )
-    inverse = np.asarray([0, 1], dtype=np.int32)
-    gradient = np.asarray([[1.5], [2.25]], dtype=ml_dtypes.bfloat16)
-    result = backend.scatter(2, 1, inverse, 2, gradient)
-    assert result.dtype == np.float32
-    np.testing.assert_allclose(result, np.asarray([[1.5], [2.25]], dtype=np.float32))
+    source = np.asarray([[1.5, 2.25]], dtype=ml_dtypes.bfloat16)
+    result = backend.array(source)
+    assert result.dtype == np.dtype("bfloat16")
+    assert result is source
 
 
 def test_cpu_fp16_pooled_gather_preserves_ieee_overflow() -> None:

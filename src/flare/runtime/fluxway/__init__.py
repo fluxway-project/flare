@@ -10,8 +10,6 @@ from flare.runtime.fluxway.placement import (
     build_affinity_placement,
 )
 from flare.runtime.fluxway.resources import (
-    CPU_COMPUTE_PROFILE,
-    DEFAULT_ROLE_PROFILES,
     ResourceProfiles,
     resolve_resource_profiles,
 )
@@ -25,8 +23,6 @@ from flare.runtime.fluxway.workers import (
 )
 
 __all__ = [
-    "CPU_COMPUTE_PROFILE",
-    "DEFAULT_ROLE_PROFILES",
     "DynamicSparseEmbeddingSPMD",
     "InputSPMD",
     "LocalLanceStorageFactory",

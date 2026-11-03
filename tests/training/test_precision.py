@@ -99,6 +99,9 @@ def test_policy_has_closed_fixed_dtype_semantics() -> None:
     assert PrecisionPolicy.fp16().compute_dtype == jnp.float16
     assert PrecisionPolicy.fp16().parameter_dtype == jnp.float32
     assert PrecisionPolicy.fp16().optimizer_dtype == jnp.float32
+    assert PrecisionPolicy.fp32().gradient_transport_dtype == jnp.float32
+    assert PrecisionPolicy.bf16().gradient_transport_dtype == jnp.bfloat16
+    assert PrecisionPolicy.fp16().gradient_transport_dtype == jnp.bfloat16
     assert PrecisionPolicy.fp32().sparse_storage_dtype_name == "float32"
     assert PrecisionPolicy.bf16().sparse_storage_dtype_name == "float16"
     assert PrecisionPolicy.fp16().sparse_storage_dtype_name == "float16"

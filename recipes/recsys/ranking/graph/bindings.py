@@ -10,10 +10,10 @@ from flare.jax.layers.state import NnxModelDefinition
 from flare.runtime.fluxway.checkpoint import checkpoint_finalizer_registration
 from flare.training.execution import TrainingExecutionPlan
 from recipes.recsys.ranking.metrics.eval_metrics import (
-    MetricsAggregatorSPMD,
+    get_metrics_aggregator_spmd_class,
 )
 from recipes.recsys.ranking.metrics.train_metrics import (
-    TrainMetricsAggregatorSPMD,
+    get_train_metrics_aggregator_spmd_class,
 )
 from recipes.recsys.ranking.workers.schedule import ranking_phase_schedule
 from recipes.recsys.ranking.workers.train_worker import (
@@ -246,20 +246,11 @@ def bind_recsys_ranking_train_metrics(
     max_inflight_steps: int,
     driver_runtime_env: dict[str, Any] | None = None,
 ) -> type:
-    if max_inflight_steps <= 0:
-        raise ValueError("max_inflight_steps must be positive")
-    return bind_spmd(
-        TrainMetricsAggregatorSPMD,
+    return get_train_metrics_aggregator_spmd_class(
+        input_sharding=input_sharding,
         resource_profile=resource_profile,
-        mesh_axis_names=("dp",),
-        mesh_axis_shapes=(1,),
         runtime_env=runtime_env,
-        checkpoint_components=(),
-        step={
-            "async_policy": AsyncPolicy.pipelined(depth=max_inflight_steps),
-            "input_sharding": input_sharding,
-            "output_sharding": {},
-        },
+        max_inflight_steps=max_inflight_steps,
         driver_runtime_env=driver_runtime_env,
     )
 
@@ -271,17 +262,10 @@ def bind_recsys_ranking_metrics(
     runtime_env: dict[str, Any],
     driver_runtime_env: dict[str, Any] | None = None,
 ) -> type:
-    return bind_spmd(
-        MetricsAggregatorSPMD,
+    return get_metrics_aggregator_spmd_class(
+        input_sharding=input_sharding,
         resource_profile=resource_profile,
-        mesh_axis_names=("dp",),
-        mesh_axis_shapes=(1,),
         runtime_env=runtime_env,
-        checkpoint_components=(),
-        step={
-            "input_sharding": input_sharding,
-            "output_sharding": {},
-        },
         driver_runtime_env=driver_runtime_env,
     )
 

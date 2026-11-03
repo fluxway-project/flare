@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 
 from flare.data.pipeline.consumption.source.execution.invocation import invoke_source
 
@@ -161,3 +162,49 @@ def test_materialize_source_ranges_single_coalesced_fast_path() -> None:
     res = asyncio.run(scenario())
     # Single coalesced range returns the exact object directly
     assert res is raw_table
+
+
+def test_materialize_source_ranges_concat_does_not_block_event_loop(
+    monkeypatch,
+) -> None:
+    import pyarrow as pa
+
+    import flare.data.pipeline.consumption.source.execution.materialization as module
+    from flare.data.pipeline.consumption.source.execution.materialization import (
+        materialize_source_ranges,
+    )
+    from flare.data.sources.locator import FileLocator
+    from flare.data.sources.range import SourceRecordRange
+
+    original_concat = module.concatenate_range_payloads
+
+    def slow_concat(payloads):
+        time.sleep(0.20)
+        return original_concat(payloads)
+
+    monkeypatch.setattr(module, "concatenate_range_payloads", slow_concat)
+    ranges = [
+        SourceRecordRange("s", "r", FileLocator("a.parquet"), 0, 2, "d", "parquet"),
+        SourceRecordRange("s", "r", FileLocator("b.parquet"), 0, 2, "d", "parquet"),
+    ]
+
+    def read(record_range: SourceRecordRange, projection):
+        return pa.table({"x": [record_range.record_start] * record_range.record_count})
+
+    async def heartbeat(stop: asyncio.Event) -> int:
+        ticks = 0
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+        return ticks
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        task = asyncio.create_task(heartbeat(stop))
+        await materialize_source_ranges(
+            ranges, read=read, projection=["x"], max_concurrent_reads=2
+        )
+        stop.set()
+        return await task
+
+    assert asyncio.run(scenario()) >= 10

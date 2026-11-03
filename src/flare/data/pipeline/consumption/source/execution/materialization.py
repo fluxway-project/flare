@@ -123,7 +123,9 @@ async def materialize_source_ranges(
         raise
     if any(payload is missing for payload in payloads):
         raise RuntimeError("source range worker completed without a payload")
-    return concatenate_range_payloads(payloads)
+    # Arrow concatenation can copy/validate hundreds of projected columns. It
+    # is CPU work and must not monopolize the Reader asyncio lane.
+    return await asyncio.to_thread(concatenate_range_payloads, payloads)
 
 
 def concatenate_range_payloads(payloads: Sequence[Any]) -> Any:

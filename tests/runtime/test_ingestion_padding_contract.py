@@ -98,7 +98,7 @@ def compile_tail(record_range=None, *, step=1, batch_size=8):
                 cardinality_metric="rows",
                 split_policy="SplittableSpan",
                 locality_key=record_range.locator.canonical(),
-                physical_identity=record_range.locator.canonical(),
+                storage_locator=record_range.locator.canonical(),
                 logical_start=record_range.record_start,
                 opaque_token=pack_metadata(record_range.to_dict()),
             ),

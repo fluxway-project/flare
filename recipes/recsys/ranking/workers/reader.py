@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -271,7 +272,12 @@ class RecsysReaderSPMD(BatchReaderSPMD):
         if isinstance(raw_batch, pa.RecordBatch):
             raw_batch = pa.Table.from_batches([raw_batch])
         if isinstance(raw_batch, pa.Table):
-            with profiler.scope("reader.transform"):
+            scope = (
+                profiler.scope("reader.transform")
+                if profiler.enabled()
+                else nullcontext()
+            )
+            with scope:
                 batch = self._batch_transformer(raw_batch)
             if not isinstance(batch, Mapping):
                 raise TypeError("ranking batch transform must return a mapping")

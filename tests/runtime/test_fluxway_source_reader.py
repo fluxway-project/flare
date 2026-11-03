@@ -69,7 +69,7 @@ class LocalSegmentReader:
         self.close_count = 0
 
     def read(self, request, *, batch_size):
-        assert request.physical_identity == "local.parquet"
+        assert request.storage_locator == "local.parquet"
         yield SegmentReadChunk(
             {"value": np.asarray([3, 5], dtype=np.int32)},
             cardinality=2,
@@ -97,7 +97,7 @@ def _activation() -> IngestionLayoutActivation:
                 unit_id="unit-0",
                 revision_identity="revision",
                 locality_key="node",
-                physical_identity="local.parquet",
+                storage_locator="local.parquet",
                 cardinality_metric="rows",
                 logical_start=0,
                 logical_end=2,
@@ -278,7 +278,7 @@ def _work_item(
         cardinality_metric="rows",
         split_policy="SplittableSpan",
         locality_key=record_range.locator.canonical(),
-        physical_identity=record_range.locator.canonical(),
+        storage_locator=record_range.locator.canonical(),
         logical_start=record_range.record_start,
         opaque_token=pack_metadata(record_range.to_dict()),
     ).slice(
@@ -357,7 +357,7 @@ async def test_assigned_reader_reuses_range_decode_across_steps(monkeypatch) -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "field", ["schema_digest", "revision_identity", "physical_identity"]
+    "field", ["schema_digest", "revision_identity", "storage_locator"]
 )
 async def test_cached_range_still_rejects_changed_assignment(field) -> None:
     source = DummyRangeReader()
@@ -598,7 +598,7 @@ async def test_assigned_reader_preserves_file_rows_across_planning_windows() -> 
         cardinality_metric="rows",
         split_policy="SplittableSpan",
         locality_key=record_range.locator.canonical(),
-        physical_identity=record_range.locator.canonical(),
+        storage_locator=record_range.locator.canonical(),
         logical_start=record_range.record_start,
         opaque_token=pack_metadata(record_range.to_dict()),
     )
@@ -713,7 +713,7 @@ async def test_native_query_session_preserves_async_payload_and_opaque_tasks():
         original.assignment.descriptor,
         unit_id="query-partition",
         locality_key="query-partition",
-        physical_identity="query://partition",
+        storage_locator="query://partition",
         opaque_token=b"native-query-token",
     )
     assignment = SourceWorkAssignment.create(

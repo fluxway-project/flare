@@ -104,6 +104,8 @@ def build_shard_map_micro_accumulate(
     transform_raw_gradients_fn: Callable[[Any], Any] | None = None,
     axis_name: str = "dp",
     retain_current_gradients: bool = False,
+    prediction_out_spec: Any | None = None,
+    raw_gradient_out_spec: Any | None = None,
 ) -> MicroStepKernels:
     """Build the first and donated accumulating distributed micro kernels."""
     mesh = mesh.mesh if isinstance(mesh, ParallelMesh) else mesh
@@ -120,6 +122,14 @@ def build_shard_map_micro_accumulate(
         raise TypeError("input_gradient_specs must be a tuple")
     if not isinstance(target_specs, tuple):
         raise TypeError("target_specs must be a tuple")
+    prediction_out_spec = (
+        P(axis_name, None) if prediction_out_spec is None else prediction_out_spec
+    )
+    raw_gradient_out_spec = (
+        tuple(P(axis_name, None) for _ in gradient_out_spec)
+        if raw_gradient_out_spec is None
+        else raw_gradient_out_spec
+    )
 
     def _reduce(current_gradients: Any) -> Any:
         return reduce_gradients_fn(current_gradients)
@@ -164,7 +174,7 @@ def build_shard_map_micro_accumulate(
             gradient_out_spec,
             input_gradient_specs,
             P(),
-            P(axis_name, None),
+            prediction_out_spec,
         ),
         check_vma=False,
     )
@@ -182,12 +192,12 @@ def build_shard_map_micro_accumulate(
             gradient_out_spec,
             input_gradient_specs,
             P(),
-            P(axis_name, None),
+            prediction_out_spec,
         ),
         check_vma=False,
     )
     first_jit = jax.jit(first_smap)
-    accumulate_jit = jax.jit(accumulate_smap, donate_argnums=(4,))
+    accumulate_jit = jax.jit(accumulate_smap, donate_argnums=(3,))
     if not retain_current_gradients:
         return MicroStepKernels(first=first_jit, accumulate=accumulate_jit)
     if transform_raw_gradients_fn is None:
@@ -242,15 +252,15 @@ def build_shard_map_micro_accumulate(
             out_specs=(
                 model_state_out_spec,
                 gradient_out_spec,
-                tuple(P(axis_name, None) for _ in gradient_out_spec),
+                raw_gradient_out_spec,
                 gradient_out_spec,
                 input_gradient_specs,
                 P(),
-                P(axis_name, None),
+                prediction_out_spec,
             ),
             check_vma=False,
         ),
-        donate_argnums=(4,),
+        donate_argnums=(3,),
     )
     return MicroStepKernels(
         first=first_jit,
@@ -263,11 +273,11 @@ def build_shard_map_micro_accumulate(
                 out_specs=(
                     model_state_out_spec,
                     gradient_out_spec,
-                    tuple(P(axis_name, None) for _ in gradient_out_spec),
+                    raw_gradient_out_spec,
                     gradient_out_spec,
                     input_gradient_specs,
                     P(),
-                    P(axis_name, None),
+                    prediction_out_spec,
                 ),
                 check_vma=False,
             )
@@ -287,12 +297,17 @@ def build_shard_map_macro_update(
     gradient_in_shardings: Any | None = None,
     accumulation_steps_sharding: Any | None = None,
     state_out_shardings: Any | None = None,
+    normalized_gradient_out_shardings: Any | None = None,
+    reduce_accumulated_fn: Callable[[Any], Any] | None = None,
     return_normalized_gradients: bool = False,
     requires_axis_context: bool = False,
+    donate_gradients: bool = True,
 ) -> Callable:
     """Build shard_map macro update function that synchronizes accumulated gradients according to ZeRO stage."""
     if zero_stage is not None:
         zero_stage = ZeroStage(zero_stage)
+    if zero_stage is not None and reduce_accumulated_fn is not None:
+        raise ValueError("choose either zero_stage or reduce_accumulated_fn")
     mesh = mesh.mesh if isinstance(mesh, ParallelMesh) else mesh
     require_distributed_execution(
         mesh=mesh,
@@ -309,7 +324,9 @@ def build_shard_map_macro_update(
         return state
 
     def _macro_update_fn(flat_state_in, acc_grads_state, accumulation_steps):
-        if zero_stage is not None:
+        if reduce_accumulated_fn is not None:
+            acc_grads_state = reduce_accumulated_fn(acc_grads_state)
+        elif zero_stage is not None:
             acc_grads_state = reduce_accumulated_gradients(
                 acc_grads_state, stage=zero_stage, axis_name=axis_name
             )
@@ -340,7 +357,9 @@ def build_shard_map_macro_update(
             check_vma=False,
         )
 
-        donate_argnums = (0, 1) if return_normalized_gradients else (0,)
+        donate_argnums = (
+            (0, 1) if return_normalized_gradients and donate_gradients else (0,)
+        )
 
         @jax.jit(donate_argnums=donate_argnums)
         def macro_update(flat_state_in, acc_grads_state, accumulation_steps):
@@ -358,10 +377,19 @@ def build_shard_map_macro_update(
             "all macro state and scalar shardings must be provided together"
         )
 
-    output_shardings = MacroUpdateOutput(state_out_shardings, gradient_in_shardings)
+    normalized_gradient_out_shardings = (
+        gradient_in_shardings
+        if normalized_gradient_out_shardings is None
+        else normalized_gradient_out_shardings
+    )
+    output_shardings = MacroUpdateOutput(
+        state_out_shardings, normalized_gradient_out_shardings
+    )
     if not return_normalized_gradients:
         output_shardings = state_out_shardings
-    donate_argnums = (0, 1) if return_normalized_gradients else (0,)
+    donate_argnums = (
+        (0, 1) if return_normalized_gradients and donate_gradients else (0,)
+    )
     if requires_axis_context:
         macro_smap = shard_map(
             _macro_update_fn,
@@ -374,7 +402,9 @@ def build_shard_map_macro_update(
             out_specs=(
                 MacroUpdateOutput(
                     tuple(sharding.spec for sharding in state_out_shardings),
-                    tuple(sharding.spec for sharding in gradient_in_shardings),
+                    tuple(
+                        sharding.spec for sharding in normalized_gradient_out_shardings
+                    ),
                 )
                 if return_normalized_gradients
                 else tuple(sharding.spec for sharding in state_out_shardings)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -10,6 +11,8 @@ from fluxway import ResourceProfile
 from sparse_embedding.checkpoint.lance_backend import _LanceCheckpointStorage
 
 from flare.jax.training.engines.contracts import TrainStepResult
+from flare.runtime.fluxway.transport import make_transport_tensor
+from flare.runtime.sparse_precision import prepare_sparse_native_gradient
 from flare.training.components.steppers import GenericLossAdapter
 from flare.training.execution import (
     GradientAccumulationPolicy,
@@ -198,6 +201,8 @@ def test_train_core_preserves_engine_normalized_sparse_gradients() -> None:
     worker._prepared_execution_for_next_batch = False
     worker.micro_step = 0
     worker.grad_accum_steps = 3
+    worker.sparse_gradient_dtype = "float32"
+    worker.sparse_gradient_transport_dtype = "bfloat16"
 
     output = worker.train_core(
         jax_input_group1_dim_16=np.zeros((2, 1, 16), dtype=np.float32),
@@ -205,7 +210,62 @@ def test_train_core_preserves_engine_normalized_sparse_gradients() -> None:
         jax_samples_valid_count=np.asarray([2], dtype=np.int32),
     )
 
-    np.testing.assert_allclose(output["grad_jax_group1_dim_16"], 12.0)
+    assert output["grad_jax_group1_dim_16"].dtype == np.dtype("bfloat16")
+    np.testing.assert_allclose(
+        np.asarray(output["grad_jax_group1_dim_16"], dtype=np.float32), 12.0
+    )
+
+
+@pytest.mark.parametrize("wire_dtype", ["float32", "bfloat16"])
+def test_scatter_sparse_gradients_quantizes_only_after_fp32_sum(
+    wire_dtype: str,
+) -> None:
+    class _SparseOperator:
+        gradient_dtype = "float32"
+
+        def execution_context(self):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        def local_array(self, value):
+            return np.asarray(value)
+
+        def inverse(self, value):
+            return np.asarray(value, dtype=np.int32)
+
+        def scatter_pooled(
+            self, emb_rows, emb_dim, inverse, pad_index, gradient, target_widths
+        ):
+            assert gradient.dtype == np.dtype("float32")
+            assert (emb_rows, emb_dim, pad_index, target_widths) == (2, 1, 2, (1, 1))
+            np.testing.assert_array_equal(inverse, [0, 0])
+            return np.asarray([[gradient.sum()], [0.0]], dtype=np.float32)
+
+    worker = object.__new__(RecsysBackboneTrainSPMD)
+    worker.ctx = SimpleNamespace(step=0)
+    worker.sparse_groups = ("group",)
+    worker.sparse_group_widths = {"group": (1, 1)}
+    worker.sparse_op = _SparseOperator()
+    worker.sparse_gradient_dtype = "float32"
+    worker.sparse_gradient_transport_dtype = wire_dtype
+    worker.execution_tracer = None
+    worker.validate_tensor_values = False
+    gradient_input = np.asarray([[[1.25]], [[2.25]]], dtype=np.float32)
+    if wire_dtype == "bfloat16":
+        gradient_input = gradient_input.astype(np.dtype("bfloat16"))
+    result = worker.scatter_sparse_grads(
+        grad_jax_group=make_transport_tensor(gradient_input),
+        padded_inverse_group=make_transport_tensor(np.asarray([0, 0], dtype=np.int32)),
+        emb_ref_group=make_transport_tensor(np.zeros((2, 1), dtype=np.float16)),
+    )["grad_group"]
+
+    assert np.dtype(result.flat_values.dtype).name == wire_dtype
+    native = prepare_sparse_native_gradient(
+        result.flat_values, transport_dtype=wire_dtype, native_dtype="float32"
+    )
+    assert native.dtype == np.dtype("float32")
+    np.testing.assert_allclose(native, [[3.5], [0.0]])
 
 
 def test_ranking_loss_scales_sparse_gradient_once_for_global_batch() -> None:

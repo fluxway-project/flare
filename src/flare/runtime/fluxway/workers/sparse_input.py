@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import Any
 
 # pyrefly: ignore[missing-import]
 import numpy as np
-import sparse_embedding as se
 from sparse_embedding.checkpoint import PartitionSpec
 
+from flare.ops.sparse_unique import unique_first_occurrence
+from flare.runtime.fluxway.workers.base import assigned_worker_cpu_count
 from flare.runtime.fluxway.workers.dynamic_embedding import (
     register_sparse_partition_resource,
     sparse_partition_resource_strategy,
@@ -23,7 +25,7 @@ from fluxway.common.bind import bind_spmd
 from fluxway.common.decorators import requires_worker_process
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.operator_policy import AsyncPolicy, StatePolicy
-from fluxway.common.tensor_backend import get_backend, prepare_dlpack_input
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.tensor_components import (
     dense_path_strides,
     nested_global_positions_kernel,
@@ -32,6 +34,52 @@ from fluxway.common.tensor_components import (
 from fluxway.common.types.tensor import TransportTensor
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_scope(name: str):
+    """Return a profiling scope without duplicating the hot-path body."""
+    return profiler.scope(name) if profiler.enabled() else nullcontext()
+
+
+def _resolve_numba_thread_limit() -> int:
+    """Use the worker's reserved CPU budget for concurrent CPU groups."""
+    try:
+        import numba
+
+        current = numba.get_num_threads()
+    except ImportError:
+        return 1
+    try:
+        import ray
+
+        allocated = assigned_worker_cpu_count(
+            ray.get_runtime_context(), role_name="Input worker"
+        )
+        return min(allocated, current)
+    except (
+        AssertionError,
+        AttributeError,
+        ImportError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return 1
+
+
+def _set_numba_thread_limit(limit: int) -> None:
+    try:
+        import numba
+    except ImportError:
+        return
+    if numba.get_num_threads() != limit:
+        numba.set_num_threads(limit)
+
+
+def _run_with_numba_thread_limit(function, limit: int, *args):
+    """Apply Numba's thread-local limit in the executor thread doing the work."""
+    _set_numba_thread_limit(limit)
+    return function(*args)
 
 
 def _unique_global_flat_positions(
@@ -89,19 +137,10 @@ def _backend_adopt(values: Any) -> Any:
     return native
 
 
-async def _backend_unique(values: Any) -> tuple[Any, Any, Any]:
+def _backend_unique(values: Any) -> tuple[Any, Any, Any]:
     native = values
     if isinstance(native, np.ndarray):
-        unique_dlm, inverse_dlm, first_dlm = await se.async_unique(
-            prepare_dlpack_input(native.reshape(-1)),
-            return_inverse=True,
-            return_first_indices=True,
-        )
-        return (
-            np.from_dlpack(unique_dlm),
-            np.from_dlpack(inverse_dlm),
-            np.from_dlpack(first_dlm),
-        )
+        return unique_first_occurrence(native.reshape(-1))
     try:
         import cupy
     except ModuleNotFoundError as exc:
@@ -123,6 +162,80 @@ async def _backend_unique(values: Any) -> tuple[Any, Any, Any]:
             first_indices[order],
         )
     raise TypeError(f"unsupported sparse deduplication array {type(native).__name__}")
+
+
+def _finalize_sparse_unique(
+    group_name: str,
+    tt: TransportTensor,
+    unique_input: Any,
+    unique_ids: Any,
+    inv_1d: Any,
+    flat_first_indices: Any,
+) -> tuple[TransportTensor, TransportTensor, Any, Any, Any]:
+    """Build routed tensors from one deduplicated sparse occurrence stream.
+
+    This helper is deliberately synchronous so the CPU backend can run it in a
+    worker thread.  GPU backends call it on the lane because their arrays must
+    remain on the owning CUDA context.
+    """
+    backend = get_backend()
+    nested_splits = tuple(tt.nested_splits)
+    nested_splits_host = tuple(
+        np.asarray(backend.to_numpy(splits), dtype=np.int32) for splits in nested_splits
+    )
+
+    if unique_input.size == 0:
+        unique_ids = unique_input.reshape(-1)
+        inv_1d = unique_input.reshape(-1).astype(np.int32, copy=False)
+        flat_first_indices = unique_input.reshape(-1)
+    else:
+        inv_1d = inv_1d.astype(np.int32, copy=False).reshape(-1)
+
+    if unique_ids.ndim != 1:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] unique must be 1D, "
+            f"got shape={unique_ids.shape}."
+        )
+    if inv_1d.size != unique_input.size:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] inverse length "
+            f"{inv_1d.size} does not match occurrence count {unique_input.size}"
+        )
+    if flat_first_indices.shape != unique_ids.shape:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] first-index shape "
+            f"{flat_first_indices.shape} does not match unique shape "
+            f"{unique_ids.shape}"
+        )
+    flat_first_indices_host = np.asarray(
+        backend.to_numpy(flat_first_indices), dtype=np.int32
+    )
+
+    widths = tuple(int(w) for w in tt.global_shape[1:])
+    with _profile_scope(f"input.positions.{group_name}"):
+        global_positions = _unique_global_flat_positions(
+            nested_splits_host,
+            flat_first_indices_host,
+            widths,
+            np.asarray(
+                backend.to_numpy(tt.origin_indices_materialized), dtype=np.int32
+            ),
+            group_name,
+        )
+    unique_global_shape = (int(np.prod(tt.global_shape, dtype=np.int64)),)
+
+    with _profile_scope(f"input.tensors.{group_name}"):
+        unique_tt = TransportTensor(
+            flat_values=unique_ids,
+            origin_indices=ExplicitIndex(global_positions),
+            global_shape=unique_global_shape,
+        )
+        inv_tt = TransportTensor(
+            flat_values=inv_1d,
+            nested_splits=list(nested_splits),
+            global_shape=tt.global_shape,
+        )
+    return unique_tt, inv_tt, global_positions, unique_ids, inv_1d
 
 
 @requires_worker_process
@@ -160,9 +273,13 @@ class InputSPMD:
             prepare_trace = getattr(execution_tracer, "prepare", None)
             if callable(prepare_trace):
                 prepare_trace()
+        self._numba_thread_limit = _resolve_numba_thread_limit()
 
     async def process(self, **kwargs: Any) -> Any:
         get_backend()
+        cpu_unique_slots = asyncio.Semaphore(
+            max(1, min(self._numba_thread_limit, len(self.sparse_groups)))
+        )
 
         async def _sparse_unique(
             g: str, tt: TransportTensor
@@ -208,68 +325,59 @@ class InputSPMD:
                     f"!= sparse row count {len(tt.nested_splits[0]) - 1}."
                 )
 
-            backend = get_backend()
-            nested_splits = tuple(tt.nested_splits)
-            nested_splits_host = tuple(
-                np.asarray(backend.to_numpy(splits), dtype=np.int32)
-                for splits in nested_splits
-            )
-
             if unique_input.size == 0:
                 unique_ids = unique_input.reshape(-1)
                 inv_1d = unique_input.reshape(-1).astype(np.int32, copy=False)
                 flat_first_indices = unique_input.reshape(-1)
             else:
-                with profiler.scope(f"input.unique.{g}"):
-                    unique_ids, inv_1d, flat_first_indices = await _backend_unique(
-                        unique_input
-                    )
-                inv_1d = inv_1d.astype(np.int32, copy=False).reshape(-1)
+                with _profile_scope(f"input.unique.{g}"):
+                    if isinstance(unique_input, np.ndarray):
+                        async with cpu_unique_slots:
+                            (
+                                unique_ids,
+                                inv_1d,
+                                flat_first_indices,
+                            ) = await asyncio.to_thread(
+                                _run_with_numba_thread_limit,
+                                _backend_unique,
+                                1,
+                                unique_input,
+                            )
+                    else:
+                        unique_ids, inv_1d, flat_first_indices = _backend_unique(
+                            unique_input
+                        )
 
-            if unique_ids.ndim != 1:
-                raise ValueError(
-                    f"[InputSPMD._sparse_unique:{g}] unique must be 1D, got "
-                    f"shape={unique_ids.shape}."
-                )
-            if inv_1d.size != unique_input.size:
-                raise ValueError(
-                    f"[InputSPMD._sparse_unique:{g}] inverse length {inv_1d.size} "
-                    f"does not match occurrence count {unique_input.size}"
-                )
-            if flat_first_indices.shape != unique_ids.shape:
-                raise ValueError(
-                    f"[InputSPMD._sparse_unique:{g}] first-index shape "
-                    f"{flat_first_indices.shape} does not match unique shape {unique_ids.shape}"
-                )
-            flat_first_indices_host = np.asarray(
-                backend.to_numpy(flat_first_indices), dtype=np.int32
-            )
-
-            widths = tuple(int(w) for w in tt.global_shape[1:])
-            with profiler.scope(f"input.positions.{g}"):
-                global_positions = _unique_global_flat_positions(
-                    nested_splits_host,
-                    flat_first_indices_host,
-                    widths,
-                    np.asarray(
-                        backend.to_numpy(tt.origin_indices_materialized),
-                        dtype=np.int32,
-                    ),
+            if isinstance(unique_input, np.ndarray):
+                with _profile_scope(f"input.finalize.{g}"):
+                    async with cpu_unique_slots:
+                        finalized = await asyncio.to_thread(
+                            _run_with_numba_thread_limit,
+                            _finalize_sparse_unique,
+                            1,
+                            g,
+                            tt,
+                            unique_input,
+                            unique_ids,
+                            inv_1d,
+                            flat_first_indices,
+                        )
+            else:
+                finalized = _finalize_sparse_unique(
                     g,
+                    tt,
+                    unique_input,
+                    unique_ids,
+                    inv_1d,
+                    flat_first_indices,
                 )
-            unique_global_shape = (int(np.prod(tt.global_shape, dtype=np.int64)),)
-
-            with profiler.scope(f"input.tensors.{g}"):
-                unique_tt = TransportTensor(
-                    flat_values=unique_ids,
-                    origin_indices=ExplicitIndex(global_positions),
-                    global_shape=unique_global_shape,
-                )
-                inv_tt = TransportTensor(
-                    flat_values=inv_1d,
-                    nested_splits=list(nested_splits),
-                    global_shape=tt.global_shape,
-                )
+            (
+                unique_tt,
+                inv_tt,
+                global_positions,
+                unique_ids,
+                inv_1d,
+            ) = finalized
             observer = getattr(self, "execution_tracer", None)
             if observer is not None:
                 observer.input_unique(

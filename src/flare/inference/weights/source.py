@@ -75,16 +75,15 @@ class PublishedAssetEvidence:
     requested_path: Path
     resolved_path: Path
     latest_target: str | None
-    device: int
     inode: int
     mtime_ns: int
-    tree_signature: tuple[tuple[str, int, int, int, int, int], ...]
+    tree_signature: tuple[tuple[str, int, int, int, int], ...]
 
     @staticmethod
     def _tree_signature(
         root: Path,
-    ) -> tuple[tuple[str, int, int, int, int, int], ...]:
-        entries: list[tuple[str, int, int, int, int, int]] = []
+    ) -> tuple[tuple[str, int, int, int, int], ...]:
+        entries: list[tuple[str, int, int, int, int]] = []
         for path in sorted(root.rglob("*")):
             relative = path.relative_to(root).as_posix()
             if path.is_symlink():
@@ -97,7 +96,6 @@ class PublishedAssetEvidence:
                 (
                     relative,
                     kind,
-                    stat.st_dev,
                     stat.st_ino,
                     stat.st_mtime_ns,
                     stat.st_size,
@@ -117,7 +115,6 @@ class PublishedAssetEvidence:
             requested_path=requested_path,
             resolved_path=resolved_path,
             latest_target=latest_target,
-            device=stat.st_dev,
             inode=stat.st_ino,
             mtime_ns=stat.st_mtime_ns,
             tree_signature=cls._tree_signature(resolved_path),
@@ -135,10 +132,9 @@ class PublishedAssetEvidence:
             raise RuntimeError("published step path changed")
         stat = self.resolved_path.stat()
         if (
-            stat.st_dev,
             stat.st_ino,
             stat.st_mtime_ns,
-        ) != (self.device, self.inode, self.mtime_ns):
+        ) != (self.inode, self.mtime_ns):
             raise RuntimeError("published asset generation changed")
         if self._tree_signature(self.resolved_path) != self.tree_signature:
             raise RuntimeError("published asset contents changed")

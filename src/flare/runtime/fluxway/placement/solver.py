@@ -73,6 +73,9 @@ def build_affinity_placement(
     affinity_tables = _affinity_sparse_tables(
         sparse_table_spmds, excluded_affinity_tables
     )
+    all_sparse_tables = tuple(
+        sparse_table_spmds[name] for name in sorted(sparse_table_spmds)
+    )
     reader_workers = workers(reader_spmd)
     affinity_relations = affinity_constraints()
     if policy == "balanced":
@@ -83,7 +86,19 @@ def build_affinity_placement(
             max_min(occupancy(input_spmd)),
         )
     elif policy == "feasible":
-        objective = lexicographic(max_min(occupancy(reader_workers)))
+        # ``feasible`` used to optimize only Reader occupancy.  The support
+        # constraint below merely required all SPMDs to touch the same set of
+        # nodes, so the solver was free to put every embedding rank on one
+        # node (and routinely did so).  Keep this policy cheaper than the
+        # weighted affinity objective, but make its placement useful for
+        # distributed training by maximizing the per-node minimum occupancy
+        # for every participating worker class.
+        objective = lexicographic(
+            max_min(occupancy(reader_workers)),
+            max_min(occupancy(input_spmd)),
+            *(max_min(occupancy(table)) for table in all_sparse_tables),
+            max_min(occupancy(compute_spmd)),
+        )
     else:
         raise ValueError(f"unknown placement policy: {policy!r}")
     return PlacementRecipe(

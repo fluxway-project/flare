@@ -131,6 +131,7 @@ def get_metrics_aggregator_spmd_class(
     input_sharding: dict[str, Any],
     runtime_env: dict[str, Any] | None,
     resource_profile: Any,
+    driver_runtime_env: dict[str, Any] | None = None,
 ) -> type:
     from fluxway.common.bind import bind_spmd
 
@@ -145,6 +146,7 @@ def get_metrics_aggregator_spmd_class(
             "input_sharding": input_sharding,
             "output_sharding": {},
         },
+        driver_runtime_env=driver_runtime_env,
     )
 
 

@@ -237,8 +237,9 @@ class BatchReaderSPMD(BaseReader):
                     status=ExecutionStatus.SOURCE_EXHAUSTED,
                     control_requests=(layout_session.acknowledgement,),
                 )
-            batch = self.transform_raw_batch(raw_batch)
-            canonical = self._to_transport_batch(batch, logical_rank, logical_world)
+            canonical = await self._materialize_transport_batch_async(
+                raw_batch, logical_rank, logical_world
+            )
             result = self._output_builder(canonical)
             if self.repeat_first_batch and self._cached_batch is None:
                 self._cached_batch = canonical
@@ -259,12 +260,9 @@ class BatchReaderSPMD(BaseReader):
         else:
             raise RuntimeError("BatchReaderSPMD has no activated Fluxway source")
 
-        batch = self.transform_raw_batch(raw_batch)
-        if profiler.enabled():
-            with profiler.scope("reader.to_transport_batch"):
-                canonical = self._to_transport_batch(batch, logical_rank, logical_world)
-        else:
-            canonical = self._to_transport_batch(batch, logical_rank, logical_world)
+        canonical = await self._materialize_transport_batch_async(
+            raw_batch, logical_rank, logical_world
+        )
         result = self._output_builder(canonical)
 
         if self._execution_audit_records is not None:
@@ -301,6 +299,31 @@ class BatchReaderSPMD(BaseReader):
         raise TypeError(
             "BatchReaderSPMD batch must be an Arrow table, record batch or mapping, "
             f"got {type(raw_batch).__name__}"
+        )
+
+    def _materialize_transport_batch(
+        self, raw_batch: Any, logical_rank: int, logical_world: int
+    ) -> Mapping[str, TransportTensor]:
+        """Convert one source payload without blocking the reader event loop."""
+        batch = self.transform_raw_batch(raw_batch)
+        return self._to_transport_batch(batch, logical_rank, logical_world)
+
+    async def _materialize_transport_batch_async(
+        self, raw_batch: Any, logical_rank: int, logical_world: int
+    ) -> Mapping[str, TransportTensor]:
+        if profiler.enabled():
+            with profiler.scope("reader.to_transport_batch"):
+                return await asyncio.to_thread(
+                    self._materialize_transport_batch,
+                    raw_batch,
+                    logical_rank,
+                    logical_world,
+                )
+        return await asyncio.to_thread(
+            self._materialize_transport_batch,
+            raw_batch,
+            logical_rank,
+            logical_world,
         )
 
     async def activate_ingestion_layout(

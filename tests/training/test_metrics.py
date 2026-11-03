@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import time
+from collections import deque
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -18,6 +19,10 @@ from flare.training.components.metrics.contracts import (
     MetricResult as TrainingMetricResult,
 )
 from flare.training.components.metrics.sinks.tensorboard import ConsoleMetricSink
+from recipes.recsys.ranking.graph.bindings import (
+    bind_recsys_ranking_metrics,
+    bind_recsys_ranking_train_metrics,
+)
 from recipes.recsys.ranking.metrics.eval_metrics import (
     MetricsAggregatorSPMD,
     get_metrics_aggregator_spmd_class,
@@ -56,6 +61,21 @@ def test_metric_worker_factories_bind_real_fluxway_workers() -> None:
     assert train.__name__ == TrainMetricsAggregatorSPMD.__name__
     assert evaluation.__name__ == MetricsAggregatorSPMD.__name__
     assert train.step._fluxway_operator_spec.async_policy.compile().max_async_lag == 3
+    train_from_graph = bind_recsys_ranking_train_metrics(
+        input_sharding={},
+        runtime_env={},
+        resource_profile=profile,
+        max_inflight_steps=3,
+    )
+    eval_from_graph = bind_recsys_ranking_metrics(
+        input_sharding={}, runtime_env={}, resource_profile=profile
+    )
+    assert train_from_graph.__name__ == train.__name__
+    assert eval_from_graph.__name__ == evaluation.__name__
+    assert (
+        train_from_graph.step._fluxway_operator_spec.async_policy.compile().max_async_lag
+        == 3
+    )
 
 
 def test_metrics_component_namespace_has_no_fluxway_worker_aliases() -> None:
@@ -82,6 +102,8 @@ def test_train_metric_worker_submits_component_window() -> None:
     worker._trained_sample_count = 8
     worker._global_step = 1
     worker._window_start_time = time.time() - 0.01
+    worker.max_pending_windows = 0
+    worker._pending_windows = deque()
 
     async def submit() -> None:
         await worker._submit_window()

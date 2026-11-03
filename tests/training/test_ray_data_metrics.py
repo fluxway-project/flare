@@ -8,7 +8,14 @@ import numpy as np
 import pytest
 
 from flare.runtime.fluxway.resources import normalize_resource_vector
-from recipes.recsys.ranking.metrics.ray_data import RayDataMetricsComputer
+from recipes.recsys.ranking.metrics.ray_data import (
+    _METRIC_PARTIAL_DTYPE,
+    RayDataMetricsComputer,
+    _merge_auc_partition_rows,
+    _merge_grouped_auc_partitions,
+    _serialize_sorted_metrics_partition,
+    _summarize_sorted_metrics_partition,
+)
 
 
 @pytest.fixture(scope="module", params=(None, 0.25))
@@ -50,10 +57,8 @@ def metric_computation(request):
         )
         datasets = []
         projection_blocks = []
-        grouped_blocks = []
         from_arrow_refs = ray.data.from_arrow_refs
         select_columns = ray.data.Dataset.select_columns
-        groupby = ray.data.Dataset.groupby
 
         def record_dataset(values):
             dataset = from_arrow_refs(values)
@@ -64,16 +69,11 @@ def metric_computation(request):
             projection_blocks.append(dataset.num_blocks())
             return select_columns(dataset, *args, **kwargs)
 
-        def record_groupby(dataset, *args, **kwargs):
-            grouped_blocks.append(dataset.num_blocks())
-            return groupby(dataset, *args, **kwargs)
-
         context = ray.data.DataContext.get_current()
         previous = context.execution_options.resource_limits.copy()
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(ray.data, "from_arrow_refs", record_dataset)
             patch.setattr(ray.data.Dataset, "select_columns", record_projection)
-            patch.setattr(ray.data.Dataset, "groupby", record_groupby)
             results = computer.compute(refs)
         assert len(datasets) == 1
         yield {
@@ -81,7 +81,6 @@ def metric_computation(request):
             "global_limits_before": previous,
             "global_limits_after": context.execution_options.resource_limits.copy(),
             "projection_blocks": projection_blocks,
-            "grouped_blocks": grouped_blocks,
             "results": results,
             "target_names": target_names,
             "labels": labels,
@@ -102,11 +101,10 @@ def test_dataset_captures_component_limits_and_restores_global_context(
     assert computation["global_limits_after"] == computation["global_limits_before"]
 
 
-def test_target_projections_and_groups_reuse_coalesced_blocks(
+def test_target_projections_reuse_coalesced_blocks(
     metric_computation,
 ) -> None:
     assert metric_computation["projection_blocks"] == [2] * 6
-    assert metric_computation["grouped_blocks"] == [2]
 
 
 def test_metrics_match_full_dataset_reference_with_ties_and_split_groups(
@@ -145,3 +143,76 @@ def test_metrics_match_full_dataset_reference_with_ties_and_split_groups(
         )
         assert result["grouped_auc_valid_group_count"] == valid_groups
         assert result["grouped_auc_weight_sum"] == total_weight
+
+
+@pytest.mark.parametrize("negative_factor", [None, 0.0, 0.25, 2.0])
+def test_segmented_group_auc_matches_sklearn_across_score_partitions(
+    negative_factor,
+) -> None:
+    from sklearn.metrics import roc_auc_score
+
+    rng = np.random.default_rng(7)
+    # One large group, many small groups, ties spanning all partitions, and
+    # single-class groups exercise the exact cross-partition merge.
+    groups = np.concatenate(
+        (np.full(400, -10, dtype=np.int64), rng.integers(0, 150, 600))
+    )
+    labels = rng.integers(0, 2, len(groups), dtype=np.int8)
+    labels[groups == 0] = 0
+    labels[groups == 1] = 1
+    scores = rng.integers(0, 11, len(groups)).astype(np.float32) / 10
+    order = np.argsort(scores, kind="stable")
+    groups, labels, scores = groups[order], labels[order], scores[order]
+    partial_rows = []
+    for start, end in zip((0, 130, 400, 750), (130, 400, 750, 1000)):
+        batch = {
+            "group_key": groups[start:end],
+            "label": labels[start:end],
+            "score": scores[start:end],
+        }
+        summary = _summarize_sorted_metrics_partition(
+            batch,
+            label_column="label",
+            score_column="score",
+        )
+        serialized = _serialize_sorted_metrics_partition(
+            batch, label_column="label", score_column="score"
+        )
+        packed = np.frombuffer(
+            serialized["summaries"][0].as_py(), dtype=_METRIC_PARTIAL_DTYPE
+        )
+        for name in _METRIC_PARTIAL_DTYPE.names or ():
+            np.testing.assert_array_equal(packed[name], summary[name])
+        partial_rows.extend(packed)
+    global_result = _merge_auc_partition_rows(
+        [row for row in partial_rows if row["is_global"]]
+    )
+    grouped_result = _merge_grouped_auc_partitions(
+        (row for row in partial_rows if not row["is_global"]),
+        negative_factor=negative_factor,
+        target_name="target",
+    )
+    assert global_result["auc"] == pytest.approx(
+        roc_auc_score(labels, scores), abs=1e-12
+    )
+    expected_weighted_auc = 0.0
+    expected_weight = 0.0
+    expected_valid = 0
+    for group in np.unique(groups):
+        selected = groups == group
+        group_labels = labels[selected]
+        positive = int(group_labels.sum())
+        negative = len(group_labels) - positive
+        if not positive or not negative:
+            continue
+        weight = float(positive)
+        if negative_factor is not None:
+            weight += negative * negative_factor
+        expected_weighted_auc += roc_auc_score(group_labels, scores[selected]) * weight
+        expected_weight += weight
+        expected_valid += 1
+    assert grouped_result["grouped_auc"] == pytest.approx(
+        expected_weighted_auc / expected_weight, abs=1e-12
+    )
+    assert grouped_result["grouped_auc_valid_group_count"] == expected_valid
+    assert grouped_result["grouped_auc_weight_sum"] == expected_weight

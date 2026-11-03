@@ -10,21 +10,29 @@ from flare.training.zero.contracts import ZeroStage
 class ZeroExecutionPolicy:
     stage: ZeroStage
     axis_name: str = "dp"
+    shard_scope: Literal["global", "node"] = "global"
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage, ZeroStage):
             raise TypeError("stage must be a ZeroStage instance")
         if not self.axis_name:
             raise ValueError("axis_name must be non-empty")
+        if self.shard_scope not in {"global", "node"}:
+            raise ValueError("shard_scope must be global or node")
+        if self.shard_scope == "node" and self.stage is ZeroStage.REPLICATED:
+            raise ValueError("node shard scope requires ZeRO stage 1, 2, or 3")
 
 
 @dataclass(frozen=True, slots=True)
 class GradientAccumulationPolicy:
     micro_steps: int = 1
+    sync_mode: Literal["boundary", "micro"] = "boundary"
 
     def __post_init__(self) -> None:
         if self.micro_steps <= 0:
             raise ValueError("micro_steps must be positive")
+        if self.sync_mode not in {"boundary", "micro"}:
+            raise ValueError("sync_mode must be boundary or micro")
 
 
 @dataclass(frozen=True, slots=True)

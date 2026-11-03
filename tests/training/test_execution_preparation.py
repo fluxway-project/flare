@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import jax
+import pytest
 
 from flare.jax.training.engines.distributed import initialize_distributed_jax
 from flare.training.execution import (
@@ -13,6 +14,23 @@ from flare.training.execution import (
     ZeroExecutionPolicy,
 )
 from flare.training.zero import ZeroStage
+
+
+def test_zero_scope_is_explicit_and_stage_validated() -> None:
+    for stage in (ZeroStage.OPTIMIZER_STATE, ZeroStage.GRADIENT, ZeroStage.PARAMETER):
+        assert ZeroExecutionPolicy(stage, shard_scope="node").shard_scope == "node"
+        assert ZeroExecutionPolicy(stage).shard_scope == "global"
+    with pytest.raises(ValueError, match="requires ZeRO stage"):
+        ZeroExecutionPolicy(ZeroStage.REPLICATED, shard_scope="node")
+    with pytest.raises(ValueError, match="global or node"):
+        ZeroExecutionPolicy(ZeroStage.GRADIENT, shard_scope="invalid")
+
+
+def test_gradient_accumulation_sync_mode_is_explicit() -> None:
+    assert GradientAccumulationPolicy(3).sync_mode == "boundary"
+    assert GradientAccumulationPolicy(3, sync_mode="micro").sync_mode == "micro"
+    with pytest.raises(ValueError, match="boundary or micro"):
+        GradientAccumulationPolicy(3, sync_mode="invalid")
 
 
 def test_distributed_jax_initialization_uses_ray_process_local_device(

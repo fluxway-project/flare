@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from fluxway.common.decorators import requires_worker_process
@@ -29,6 +30,7 @@ from flare.runtime.fluxway.transport import make_transport_tensor, transport_pay
 from flare.runtime.fluxway.workers.base import require_operator_step
 from flare.runtime.sparse_precision import (
     SPARSE_NATIVE_GRADIENT_DTYPE,
+    prepare_sparse_native_gradient,
     require_finite_sparse_values,
     require_sparse_tensor_dtype,
 )
@@ -421,6 +423,10 @@ class RecsysBackboneTrainSPMD:
             "scores": jax.nn.sigmoid(predictions["logits"]),
             "loss": result.loss,
         }
+        native_dtype = getattr(
+            self, "sparse_gradient_dtype", SPARSE_NATIVE_GRADIENT_DTYPE
+        )
+        transport_dtype = getattr(self, "sparse_gradient_transport_dtype", native_dtype)
         for group in self.sparse_groups:
             gradient = sparse_input_gradients.get(group)
             if gradient is None:
@@ -432,60 +438,68 @@ class RecsysBackboneTrainSPMD:
             # its keyed sum by the actual commit-window length. Scaling here by
             # configured accumulation steps would double-divide full windows
             # and under-scale partial windows; ID frequency is not either factor.
+            # Keep sparse accumulation in the native FP32 dtype, but use the
+            # configured wire dtype before the gradient leaves the JAX worker.
+            # This is the actual JAX -> Fluxway boundary; casting only after
+            # host scatter would leave the large FP32 payload on the hot path.
+            if transport_dtype != native_dtype:
+                gradient = gradient.astype(jnp.dtype(transport_dtype))
             output[f"grad_jax_{group}"] = gradient
         return output
 
     def scatter_sparse_grads(self, **kwargs: Any) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for group in self.sparse_groups:
-            gradient = kwargs.get(f"grad_jax_{group}")
-            inverse_name = f"padded_inverse_{group}"
-            embedding_name = f"emb_ref_{group}"
-            operator_step = require_operator_step(
-                self, "RecsysBackboneTrain.scatter_sparse_grads"
-            )
-            gradient_array = self.sparse_op.local_array(transport_payload(gradient))
-            if (
-                np.dtype(gradient_array.dtype).name
-                != self.sparse_gradient_transport_dtype
-            ):
-                gradient_array = gradient_array.astype(
-                    self.sparse_gradient_transport_dtype, copy=False
+        operator_step = require_operator_step(
+            self, "RecsysBackboneTrain.scatter_sparse_grads"
+        )
+        pending: list[tuple[str, Any, Any, Any]] = []
+        # All groups use the operator's one nonblocking stream. Queue scatter
+        # and BF16 casts together, then synchronize once before Fluxway routes
+        # any buffer from another stream or process.
+        with self.sparse_op.execution_context() as stream:
+            for group in self.sparse_groups:
+                gradient = kwargs.get(f"grad_jax_{group}")
+                gradient_array = prepare_sparse_native_gradient(
+                    self.sparse_op.local_array(transport_payload(gradient)),
+                    transport_dtype=self.sparse_gradient_transport_dtype,
+                    native_dtype=self.sparse_gradient_dtype,
+                    validate_values=getattr(self, "validate_tensor_values", False),
                 )
-            if getattr(self, "validate_tensor_values", False):
-                gradient_array = require_finite_sparse_values(
+                emb_ref = kwargs[f"emb_ref_{group}"]
+                embedding_ref = self.sparse_op.local_array(transport_payload(emb_ref))
+                inverse_value = kwargs[f"padded_inverse_{group}"]
+                emb_dim = int(embedding_ref.shape[-1])
+                grad = self.sparse_op.scatter_pooled(
+                    int(embedding_ref.shape[0]),
+                    emb_dim,
+                    self.sparse_op.inverse(transport_payload(inverse_value)),
+                    int(embedding_ref.shape[0]),
                     gradient_array,
-                    self.sparse_gradient_transport_dtype,
-                    boundary=f"model_gradient_input:{group}",
+                    self.sparse_group_widths[group],
                 )
-            gradient_array = require_sparse_tensor_dtype(
-                gradient_array,
-                self.sparse_gradient_transport_dtype,
-                boundary=f"model_gradient_input:{group}",
-            )
-            emb_ref = kwargs[embedding_name]
-            embedding_ref = self.sparse_op.local_array(transport_payload(emb_ref))
-            inverse_value = kwargs[inverse_name]
-            emb_dim = int(embedding_ref.shape[-1])
-            grad = self.sparse_op.scatter_pooled(
-                int(embedding_ref.shape[0]),
-                emb_dim,
-                self.sparse_op.inverse(transport_payload(inverse_value)),
-                int(embedding_ref.shape[0]),
-                gradient_array,
-                self.sparse_group_widths[group],
-            )
-            if getattr(self, "validate_tensor_values", False):
-                grad = require_finite_sparse_values(
+                if getattr(self, "validate_tensor_values", False):
+                    grad = require_finite_sparse_values(
+                        grad,
+                        self.sparse_op.gradient_dtype,
+                        boundary=f"model_gradient_scatter:{group}",
+                    )
+                grad = require_sparse_tensor_dtype(
                     grad,
                     self.sparse_op.gradient_dtype,
                     boundary=f"model_gradient_scatter:{group}",
                 )
-            grad = require_sparse_tensor_dtype(
-                grad,
-                self.sparse_op.gradient_dtype,
-                boundary=f"model_gradient_scatter:{group}",
-            )
+                # Scatter accumulates in FP32. Quantize only after the keyed sum.
+                if np.dtype(grad.dtype).name != self.sparse_gradient_transport_dtype:
+                    grad = grad.astype(self.sparse_gradient_transport_dtype)
+                grad = require_sparse_tensor_dtype(
+                    grad,
+                    self.sparse_gradient_transport_dtype,
+                    boundary=f"model_gradient_transport:{group}",
+                )
+                pending.append((group, grad, inverse_value, emb_ref))
+            if stream is not None:
+                stream.synchronize()
+        result: dict[str, Any] = {}
+        for group, grad, inverse_value, emb_ref in pending:
             result[f"grad_{group}"] = make_transport_tensor(
                 grad, source_step=operator_step
             )

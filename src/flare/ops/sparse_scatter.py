@@ -56,6 +56,46 @@ def _scatter_pooled_numba_kernel(
     return out
 
 
+@numba.njit(parallel=True, fastmath=True, nogil=True, cache=True)
+def _scatter_pooled_chunked_numba_kernel(
+    emb_rows: int,
+    emb_dim: int,
+    inverse: np.ndarray,
+    pad_index: int,
+    gradient: np.ndarray,
+    feature_count: int,
+    max_elements: int,
+    chunk_count: int,
+) -> np.ndarray:
+    """Scatter in independent slot chunks using bounded thread-local buffers.
+
+    Slot-major traversal reads pooled gradients contiguously. Each chunk owns
+    a private dense accumulator, so duplicate IDs never race. A final row-major
+    reduction writes contiguous output and combines the partial sums.
+    """
+    partial = np.zeros((chunk_count, emb_rows, emb_dim), dtype=gradient.dtype)
+    slots = inverse.shape[0]
+    for chunk in numba.prange(chunk_count):
+        start = slots * chunk // chunk_count
+        end = slots * (chunk + 1) // chunk_count
+        for slot in range(start, end):
+            row = inverse[slot]
+            if row != pad_index:
+                feature = (slot // max_elements) % feature_count
+                batch = slot // (feature_count * max_elements)
+                for dim in range(emb_dim):
+                    partial[chunk, row, dim] += gradient[batch, feature, dim]
+
+    out = np.zeros((emb_rows, emb_dim), dtype=gradient.dtype)
+    for row in numba.prange(emb_rows):
+        for dim in range(emb_dim):
+            value = 0.0
+            for chunk in range(chunk_count):
+                value += partial[chunk, row, dim]
+            out[row, dim] = value
+    return out
+
+
 def scatter_pooled_numba(
     emb_rows: int,
     emb_dim: int,
@@ -66,6 +106,33 @@ def scatter_pooled_numba(
 ) -> np.ndarray:
     feature_count, max_elements = pooled_sparse_widths(target_widths)
     gradient = gradient.reshape((-1, feature_count, emb_dim))
+    slots = inverse.shape[0]
+
+    # Dimension-parallel scatter has only ``emb_dim`` independent tasks and
+    # accesses the row-major gradient with a dimension-sized stride. When this
+    # underfills the CPU, split the contiguous slot range into private partial
+    # accumulators, then reduce those accumulators by contiguous output rows.
+    if slots >= 4096 and emb_dim < max(32, 2 * numba.get_num_threads()):
+        bytes_per_chunk = emb_rows * emb_dim * np.dtype(gradient.dtype).itemsize
+        # A small cap keeps initialization and final reduction cache-resident;
+        # increasing chunk_count for large output tables costs more than it
+        # gains in slot-level parallelism.
+        scratch_budget = 8 * 1024 * 1024
+        chunk_count = min(
+            numba.get_num_threads(),
+            max(1, scratch_budget // max(1, bytes_per_chunk)),
+        )
+        return _scatter_pooled_chunked_numba_kernel(
+            emb_rows,
+            emb_dim,
+            inverse,
+            pad_index,
+            gradient,
+            feature_count,
+            max_elements,
+            int(chunk_count),
+        )
+
     return _scatter_pooled_numba_kernel(
         emb_rows,
         emb_dim,

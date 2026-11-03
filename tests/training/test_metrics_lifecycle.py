@@ -70,7 +70,12 @@ def metric_worker(request, monkeypatch):
 
         monkeypatch.setattr(ray, "get", get_result)
 
-    def create(*, window_steps: int, target_step: int | None):
+    def create(
+        *,
+        window_steps: int,
+        target_step: int | None,
+        max_pending_windows: int = 0,
+    ):
         worker_class = (
             train_metrics.TrainMetricsAggregatorSPMD
             if request.param == "train"
@@ -84,12 +89,17 @@ def metric_worker(request, monkeypatch):
             "target_names": ("click",),
         }
         if request.param == "train":
-            arguments.update(log_dir="unused", target_step=target_step)
+            arguments.update(
+                log_dir="unused",
+                target_step=target_step,
+                max_pending_windows=max_pending_windows,
+            )
         else:
             arguments.update(max_steps=target_step)
         worker_class.__init__(worker, **arguments)
         return worker
 
+    create.kind = request.param
     return create, computer
 
 
@@ -175,5 +185,89 @@ def test_source_exhaustion_flushes_only_remaining_valid_rows(metric_worker):
         await invoke_step(worker, **metric_batch(valid_rows=1))
         await worker.on_shutdown()
         assert computer.finished_rows == [3]
+
+    asyncio.run(scenario())
+
+
+def test_background_train_window_overlaps_next_step(metric_worker):
+    create, computer = metric_worker
+    if create.kind != "train":
+        pytest.skip("background windows are training-only")
+    worker = create(window_steps=1, target_step=None, max_pending_windows=2)
+
+    async def scenario():
+        computer.release.clear()
+        try:
+            await asyncio.wait_for(invoke_step(worker, **metric_batch()), timeout=1)
+            await asyncio.wait_for(computer.started.wait(), timeout=1)
+            assert not computer.tasks[0].done()
+        finally:
+            computer.release.set()
+            await worker.on_shutdown()
+        assert computer.finished_rows == [2]
+
+    asyncio.run(scenario())
+
+
+def test_background_train_window_backpressures_at_bound(metric_worker):
+    create, computer = metric_worker
+    if create.kind != "train":
+        pytest.skip("background windows are training-only")
+    worker = create(
+        window_steps=1,
+        target_step=None,
+        max_pending_windows=1,
+    )
+
+    async def scenario():
+        computer.release.clear()
+        await invoke_step(worker, **metric_batch())
+        second = asyncio.create_task(invoke_step(worker, **metric_batch()))
+        try:
+            await asyncio.wait_for(computer.started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not second.done()
+        finally:
+            computer.release.set()
+            await second
+            await worker.on_shutdown()
+        assert computer.finished_rows == [2, 2]
+
+    asyncio.run(scenario())
+
+
+def test_background_train_metric_failure_surfaces_on_shutdown(metric_worker):
+    create, computer = metric_worker
+    if create.kind != "train":
+        pytest.skip("background windows are training-only")
+    worker = create(window_steps=1, target_step=None, max_pending_windows=2)
+    computer.error = RuntimeError("metric reduction failed")
+
+    async def scenario():
+        await invoke_step(worker, **metric_batch())
+        with pytest.raises(RuntimeError, match="metric reduction failed"):
+            await worker.on_shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_background_train_terminal_step_waits_for_metrics(metric_worker):
+    create, computer = metric_worker
+    if create.kind != "train":
+        pytest.skip("background windows are training-only")
+    worker = create(window_steps=1, target_step=1, max_pending_windows=2)
+
+    async def scenario():
+        computer.release.clear()
+        step = asyncio.create_task(invoke_step(worker, **metric_batch()))
+        try:
+            await asyncio.wait_for(computer.started.wait(), timeout=1)
+            assert not step.done()
+            computer.release.set()
+            await step
+            assert computer.finished_rows == [2]
+        finally:
+            computer.release.set()
+            await worker.on_shutdown()
 
     asyncio.run(scenario())

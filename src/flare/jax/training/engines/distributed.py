@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -26,7 +27,6 @@ from flare.jax.training.nnx.state import NnxTrainingStateDefinition
 from flare.jax.training.state.layout import FlatStateLayout
 from flare.jax.training.state.packers import NnxStatePacker
 from flare.jax.training.steppers import (
-    MacroUpdateOutput,
     build_shard_map_macro_update,
     build_shard_map_micro_accumulate,
     compute_module_and_input_gradients,
@@ -93,20 +93,30 @@ def initialize_distributed_jax(
         )
 
 
-def _global_array_from_local(value: Any, *, mesh: Mesh, axis_name: str) -> jax.Array:
+def _global_array_from_local(
+    value: Any, *, mesh: Mesh, axis_name: str | tuple[str, ...]
+) -> jax.Array:
+    sharding = NamedSharding(mesh, P(axis_name))
+    if isinstance(value, jax.Array) and value.sharding == sharding:
+        return value
     local = jnp.asarray(value)
+    axes = (axis_name,) if isinstance(axis_name, str) else axis_name
     return jax.make_array_from_single_device_arrays(
-        (int(mesh.shape[axis_name]) * local.shape[0],) + tuple(local.shape[1:]),
-        NamedSharding(mesh, P(axis_name)),
+        (math.prod(int(mesh.shape[axis]) for axis in axes) * local.shape[0],)
+        + tuple(local.shape[1:]),
+        sharding,
         [jax.device_put(local, device) for device in mesh.local_devices],
     )
 
 
 def _replicated_array(value: Any, *, mesh: Mesh) -> jax.Array:
+    sharding = NamedSharding(mesh, P())
+    if isinstance(value, jax.Array) and value.sharding == sharding:
+        return value
     local = jnp.asarray(value)
     return jax.make_array_from_single_device_arrays(
         local.shape,
-        NamedSharding(mesh, P()),
+        sharding,
         [jax.device_put(local, device) for device in mesh.local_devices],
     )
 
@@ -181,7 +191,8 @@ class DistributedNnxTrainEngine:
     accumulated parameter gradients partitioned; ZeRO-3 partitions model and
     optimizer leaves and materializes model leaves with all-gather for each
     micro-step.  Optimizer updates run on globally-shaped arrays so NNX sees
-    the original leaf shapes after decoding.
+    the original leaf shapes after decoding. A node-local shard scope may
+    replicate ZeRO ownership across nodes while retaining global data parallelism.
     """
 
     def __init__(
@@ -203,6 +214,30 @@ class DistributedNnxTrainEngine:
         target_shardings: Mapping[str, P] | None = None,
         validate_non_param_replication: bool = False,
     ) -> None:
+        local_zero_size = local_world_size if plan.zero.shard_scope == "node" else None
+        if plan.zero.shard_scope == "node" and local_zero_size is None:
+            raise ValueError("node ZeRO scope requires local_world_size")
+        if local_zero_size is not None and (
+            isinstance(local_zero_size, bool)
+            or not isinstance(local_zero_size, int)
+            or local_zero_size <= 0
+        ):
+            raise ValueError("local_zero_size must be a positive integer")
+        if local_zero_size is not None and local_rank != rank % local_zero_size:
+            raise ValueError(
+                "node ZeRO scope requires process ranks contiguous within each host"
+            )
+        if local_zero_size is not None and (
+            plan.zero.stage
+            not in (ZeroStage.OPTIMIZER_STATE, ZeroStage.GRADIENT, ZeroStage.PARAMETER)
+            or plan.zero.axis_name != "dp"
+            or local_world_size != local_zero_size
+            or world_size % local_zero_size
+        ):
+            raise ValueError(
+                "node-local ZeRO requires a dp axis, "
+                "local_zero_size=local_world_size, and a divisible world size"
+            )
         if not jax.distributed.is_initialized():
             initialize_distributed_jax(
                 rank=rank,
@@ -229,6 +264,7 @@ class DistributedNnxTrainEngine:
                 f"got {type(state_definition).__name__}"
             )
         self.plan = plan
+        self.local_zero_size = local_zero_size
         if not isinstance(state_lifecycle, TrainingStateLifecycle):
             raise TypeError(
                 "state_lifecycle must be TrainingStateLifecycle, "
@@ -260,9 +296,17 @@ class DistributedNnxTrainEngine:
         self.world_size = world_size
         axis_name = plan.zero.axis_name
         resolved_devices = tuple(jax.devices() if devices is None else devices)
-        self.parallel_mesh = ParallelMesh.from_axes(
-            devices=resolved_devices, **{axis_name: len(resolved_devices)}
+        axes = (
+            {"node": world_size // local_zero_size, axis_name: local_zero_size}
+            if local_zero_size is not None
+            else {axis_name: world_size}
         )
+        self.parallel_mesh = ParallelMesh.from_axes(devices=resolved_devices, **axes)
+        if local_zero_size is not None:
+            self.target_specs = tuple(
+                self.batch_spec if spec == P("dp") else spec
+                for spec in self.target_specs
+            )
         self.zero_strategy = ZeroShardingStrategy.from_execution_plan(
             plan, self.parallel_mesh
         )
@@ -274,13 +318,15 @@ class DistributedNnxTrainEngine:
         self.packer = state_definition.packer()
         self.model_leaf_count = self.packer.leaf_count("model")
         full_flat_state = state_definition.abstract_flat_leaves()
-        self.state_layout = FlatStateLayout.from_abstract(full_flat_state, world_size)
+        self.state_layout = FlatStateLayout.from_abstract(
+            full_flat_state, self.zero_size
+        )
         self.model_state_layout = self.state_layout.prefix(self.model_leaf_count)
 
         param_state = state_definition.abstract_gradient_state()
         self.gradient_treedef = jtu.tree_structure(param_state)
         self.gradient_layout = FlatStateLayout.from_abstract(
-            tuple(jtu.tree_leaves(param_state)), world_size
+            tuple(jtu.tree_leaves(param_state)), self.zero_size
         )
         self._checkpoint_value_materializers = (
             self._build_checkpoint_value_materializers(self.state_layout)
@@ -304,6 +350,7 @@ class DistributedNnxTrainEngine:
         self.micro_accumulate_fn_jit: Callable[..., Any] | None = None
         self.micro_accumulate_diagnostic_fn_jit: Callable[..., Any] | None = None
         self.macro_fn_jit: Callable[..., Any] | None = None
+        self.macro_reduce_fn_jit: Callable[..., Any] | None = None
         self.step = 0
         self.micro_step = 0
         self._prepared_execution_signature: tuple[Any, ...] | None = None
@@ -342,7 +389,41 @@ class DistributedNnxTrainEngine:
 
     @property
     def axis_name(self) -> str:
-        return self.parallel_mesh.axis_names[0]
+        return self.plan.zero.axis_name
+
+    @property
+    def batch_axes(self) -> str | tuple[str, str]:
+        return (
+            ("node", self.axis_name)
+            if getattr(self, "local_zero_size", None) is not None
+            else self.axis_name
+        )
+
+    @property
+    def batch_spec(self) -> P:
+        return P(self.batch_axes)
+
+    @property
+    def zero_size(self) -> int:
+        return self.world_size if self.local_zero_size is None else self.local_zero_size
+
+    @property
+    def _defer_gradient_sync(self) -> bool:
+        return (
+            self.plan.zero.stage
+            in (ZeroStage.OPTIMIZER_STATE, ZeroStage.GRADIENT, ZeroStage.PARAMETER)
+            and self.plan.accumulation.micro_steps > 1
+            and self.plan.accumulation.sync_mode == "boundary"
+            and not self._retain_parameter_gradients
+        )
+
+    @property
+    def accumulation_specs(self) -> tuple[P, ...]:
+        # Unequal rank-local gradients must not be declared replicated P().
+        return tuple(
+            P(self.batch_axes, None) if self._defer_gradient_sync else spec
+            for spec in self.gradient_specs
+        )
 
     @property
     def _runtime_state_sharders(self) -> tuple[Callable[[Any], jax.Array], ...]:
@@ -509,6 +590,19 @@ class DistributedNnxTrainEngine:
                     f"input gradient keys are missing from inputs: {missing_keys}"
                 )
         stage = self.plan.zero.stage
+        transport_dtype = (
+            self.state_definition.precision_policy.gradient_transport_dtype
+        )
+
+        def synchronize_gradients(gradients: Any) -> tuple[Any, ...]:
+            return reduce_microstep_gradients(
+                gradients,
+                self.gradient_layout.leaves,
+                stage=stage,
+                axis_name=self.batch_axes,
+                world_size=self.world_size,
+                transport_dtype=transport_dtype,
+            )
 
         def micro_impl(
             flat_state: tuple[Any, ...],
@@ -564,12 +658,12 @@ class DistributedNnxTrainEngine:
             def synchronize_non_param_leaf(leaf: Any) -> Any:
                 dtype = jnp.dtype(leaf.dtype)
                 if jnp.issubdtype(dtype, jnp.inexact):
-                    return jax.lax.pmean(leaf, self.axis_name)
+                    return jax.lax.pmean(leaf, self.batch_axes)
                 if jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(
                     dtype, jnp.bool_
                 ):
                     gathered = jax.lax.all_gather(
-                        leaf, self.axis_name, axis=0, tiled=False
+                        leaf, self.batch_axes, axis=0, tiled=False
                     )
                     if self._validate_non_param_replication:
                         jax.debug.callback(
@@ -591,7 +685,7 @@ class DistributedNnxTrainEngine:
             )
             if stage is ZeroStage.PARAMETER:
                 updated_model_values = tuple(
-                    value.reshape(self.world_size, -1)[
+                    value.reshape(self.zero_size, -1)[
                         jax.lax.axis_index(self.axis_name)
                     ]
                     for value in updated_model_values
@@ -599,7 +693,7 @@ class DistributedNnxTrainEngine:
             else:
                 updated_model_values = tuple(updated_model_values)
 
-            loss = jax.lax.pmean(jnp.asarray(loss, dtype=jnp.float32), self.axis_name)
+            loss = jax.lax.pmean(jnp.asarray(loss, dtype=jnp.float32), self.batch_axes)
             # The current sample-mean contract uses this factor once. Do not
             # reuse it for a deliberate sparse-sum/token-mean policy.
             input_gradients = normalize_input_gradients(
@@ -616,21 +710,12 @@ class DistributedNnxTrainEngine:
                 predictions["logits"],
             )
 
-        input_specs = tuple(P(self.axis_name) for _ in input_keys)
+        input_specs = tuple(self.batch_spec for _ in input_keys)
         input_gradient_specs = tuple(
             input_specs[input_keys.index(key)]
             for key in self.input_gradient_keys or input_keys
         )
-        gradient_out_specs = tuple(self.gradient_specs)
-
-        def reduction(gradients: Any) -> tuple[Any, ...]:
-            return reduce_microstep_gradients(
-                gradients,
-                self.gradient_layout.leaves,
-                stage=stage,
-                axis_name=self.axis_name,
-                world_size=self.world_size,
-            )
+        gradient_out_specs = tuple(self.accumulation_specs)
 
         def transform_raw_gradients(gradients: Any) -> tuple[Any, ...]:
             return tuple(
@@ -639,6 +724,11 @@ class DistributedNnxTrainEngine:
                     gradients, self.gradient_layout.leaves, strict=True
                 )
             )
+
+        def reduction(gradients: Any) -> tuple[Any, ...]:
+            if self._defer_gradient_sync:
+                return transform_raw_gradients(gradients)
+            return synchronize_gradients(gradients)
 
         micro_kernels = build_shard_map_micro_accumulate(
             micro_impl,
@@ -653,6 +743,10 @@ class DistributedNnxTrainEngine:
             transform_raw_gradients_fn=transform_raw_gradients,
             axis_name=self.axis_name,
             retain_current_gradients=self._retain_parameter_gradients,
+            prediction_out_spec=P(self.batch_axes, None),
+            raw_gradient_out_spec=tuple(
+                P(self.batch_axes, None) for _ in gradient_out_specs
+            ),
         )
         self.micro_fn_jit = micro_kernels.first
         self.micro_accumulate_fn_jit = micro_kernels.accumulate
@@ -669,7 +763,7 @@ class DistributedNnxTrainEngine:
                 state_layout=self.state_layout,
                 gradient_layout=self.gradient_layout,
                 gradient_treedef=self.gradient_treedef,
-                world_size=self.world_size,
+                world_size=self.zero_size,
                 axis_name=self.axis_name,
             )
 
@@ -682,24 +776,55 @@ class DistributedNnxTrainEngine:
             shard_update_runtime=shard_update_runtime,
         )
 
+        def reduce_at_macro(gradients: Any) -> tuple[Any, ...]:
+            return synchronize_gradients(tuple(value[0] for value in gradients))
+
+        def optimizer_state_only(flat_state: Any, gradients: Any, steps: Any) -> Any:
+            updated_state, _ = optimizer_update(flat_state, gradients, steps)
+            return updated_state
+
+        self.macro_reduce_fn_jit = None
+        if self._defer_gradient_sync and stage is ZeroStage.PARAMETER:
+            # ZeRO-3 uses a global-sharding optimizer JIT. Keep its collective
+            # in a separate shard_map executable to preserve the axis context
+            # and a clear dependency on the one reduction per window.
+            self.macro_reduce_fn_jit = jax.jit(
+                jax.shard_map(
+                    reduce_at_macro,
+                    mesh=self.mesh,
+                    in_specs=(tuple(self.accumulation_specs),),
+                    out_specs=tuple(self.gradient_specs),
+                    check_vma=False,
+                )
+            )
+        macro_gradient_specs = (
+            self.gradient_specs
+            if self.macro_reduce_fn_jit is not None
+            else self.accumulation_specs
+        )
+
         self.macro_fn_jit = build_shard_map_macro_update(
-            optimizer_update,
+            optimizer_state_only,
             self.mesh,
             self.state_specs,
             gradient_out_specs,
             zero_stage=None,
             axis_name=self.axis_name,
+            reduce_accumulated_fn=(
+                reduce_at_macro
+                if self._defer_gradient_sync and self.macro_reduce_fn_jit is None
+                else None
+            ),
             state_in_shardings=tuple(
                 NamedSharding(self.mesh, spec) for spec in self.state_specs
             ),
             gradient_in_shardings=tuple(
-                NamedSharding(self.mesh, spec) for spec in self.gradient_specs
+                NamedSharding(self.mesh, spec) for spec in macro_gradient_specs
             ),
             accumulation_steps_sharding=NamedSharding(self.mesh, P()),
             state_out_shardings=tuple(
                 NamedSharding(self.mesh, spec) for spec in self.state_specs
             ),
-            return_normalized_gradients=True,
             requires_axis_context=shard_update_runtime is not None,
         )
 
@@ -714,13 +839,13 @@ class DistributedNnxTrainEngine:
         keys = tuple(inputs)
         global_inputs = tuple(
             _global_array_from_local(
-                inputs[key], mesh=self.mesh, axis_name=self.axis_name
+                inputs[key], mesh=self.mesh, axis_name=self.batch_axes
             )
             for key in keys
         )
         target_values = tuple(
-            _global_array_from_local(value, mesh=self.mesh, axis_name=self.axis_name)
-            if spec == P("dp")
+            _global_array_from_local(value, mesh=self.mesh, axis_name=self.batch_axes)
+            if spec == self.batch_spec
             else _replicated_array(value, mesh=self.mesh)
             for value, spec in zip(
                 (targets[key] for key in self.target_keys),
@@ -759,13 +884,13 @@ class DistributedNnxTrainEngine:
                 jax.ShapeDtypeStruct(
                     global_shape,
                     dtype,
-                    sharding=NamedSharding(self.mesh, P(self.axis_name)),
+                    sharding=NamedSharding(self.mesh, self.batch_spec),
                 )
             )
         target_values: list[jax.ShapeDtypeStruct] = []
         for key, spec in zip(self.target_keys, self.target_specs, strict=True):
             shape, dtype = self._value_shape_dtype(targets[key])
-            if spec == P(self.axis_name):
+            if spec == self.batch_spec:
                 if not shape:
                     raise ValueError(
                         f"distributed target {key!r} must have a leading batch dimension"
@@ -781,14 +906,17 @@ class DistributedNnxTrainEngine:
         return tuple(input_values), tuple(target_values)
 
     def _abstract_gradient_arguments(self) -> tuple[jax.ShapeDtypeStruct, ...]:
+        deferred = getattr(self, "_defer_gradient_sync", False)
         return tuple(
             jax.ShapeDtypeStruct(
-                (layout.padded_size,),
+                (self.world_size, layout.padded_size)
+                if deferred
+                else (layout.padded_size,),
                 jnp.dtype(layout.dtype),
                 sharding=NamedSharding(self.mesh, spec),
             )
             for layout, spec in zip(
-                self.gradient_layout.leaves, self.gradient_specs, strict=True
+                self.gradient_layout.leaves, self.accumulation_specs, strict=True
             )
         )
 
@@ -863,9 +991,13 @@ class DistributedNnxTrainEngine:
         ).compile()
         if self.macro_fn_jit is None:
             raise RuntimeError("distributed macro kernel was not initialized")
+        macro_gradients = abstract_gradients
+        if self.macro_reduce_fn_jit is not None:
+            self.macro_reduce_fn_jit.lower(abstract_gradients).compile()
+            macro_gradients = self._abstract_gradient_layout()
         self.macro_fn_jit.lower(
             abstract_state,
-            abstract_gradients,
+            macro_gradients,
             jax.ShapeDtypeStruct((), jnp.int32, sharding=NamedSharding(self.mesh, P())),
         ).compile()
         self._prepared_execution_signature = signature
@@ -1023,15 +1155,14 @@ class DistributedNnxTrainEngine:
             )
         if self.flat_state is None:
             raise RuntimeError("distributed state is not initialized")
-        macro_output = self.macro_fn_jit(
+        macro_gradients = self.accumulated_gradients
+        if self.macro_reduce_fn_jit is not None:
+            macro_gradients = self.macro_reduce_fn_jit(macro_gradients)
+        self.flat_state = self.macro_fn_jit(
             self.flat_state,
-            self.accumulated_gradients,
+            macro_gradients,
             jnp.asarray(accumulated_steps, dtype=jnp.int32),
         )
-        if not isinstance(macro_output, MacroUpdateOutput):
-            raise TypeError("distributed macro kernel must return MacroUpdateOutput")
-        self.flat_state = macro_output.state
-        del macro_output
         self.accumulated_gradients = None
         self.micro_step = 0
         self.step += 1

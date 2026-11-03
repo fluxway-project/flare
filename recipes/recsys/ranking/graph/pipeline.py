@@ -13,10 +13,7 @@ from flare.data.pipeline.consumption.source.contracts.source import SourceFactor
 from flare.data.schema.feature_catalog import FeatureCatalog, FeatureOutputKind
 from flare.data.schema.feature_layout import build_training_feature_layout
 from flare.mesh import bind_sparse_worker_meshes, build_1d_device_mesh
-from flare.runtime.fluxway.resources.resolution import (
-    ResourceProfiles,
-    resolve_resource_profiles,
-)
+from flare.runtime.fluxway.resources.resolution import ResourceProfiles
 from flare.runtime.fluxway.source import (
     WorkItemScheduledDatasetSourceDescriptor,
 )
@@ -28,6 +25,7 @@ from flare.runtime.fluxway.workers.reader_contracts import (
 )
 from flare.runtime.fluxway.workers.sparse_input import get_input_spmd_class
 from flare.runtime.sparse_precision import require_key_dtype
+from recipes.recsys.ranking.resources import resolve_ranking_resource_profiles
 from recipes.recsys.ranking.schema.sparse_features import (
     extract_sparse_groups_and_dimensions,
     parse_sparse_workers,
@@ -115,9 +113,11 @@ def build_pipeline_nodes(
             "table": sum(sparse_workers_config.values()),
             "metrics": 1,
         }
-        resources = resolve_resource_profiles(
+        resources = resolve_ranking_resource_profiles(
             worker_counts,
             compute_device="cpu" if args.jax_platform == "cpu" else "gpu",
+            metric_ray_parallelism=getattr(args, "metric_ray_parallelism", 2),
+            input_cpus=getattr(args, "input_cpus", None),
         )
 
     local_pipeline_depth = int(args.sparse_max_staleness_steps) + 1
