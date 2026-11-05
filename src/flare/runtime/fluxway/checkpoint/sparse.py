@@ -13,7 +13,7 @@ def sparse_checkpoint_registration(
     *,
     component_id: str,
     lineage_name: str,
-    weight_group: str | None = None,
+    output_path: str | None = None,
     backend: str,
     load_optimizer_state: bool = True,
     mode: CheckpointSaveMode,
@@ -27,7 +27,7 @@ def sparse_checkpoint_registration(
     component = SparseEmbeddingCheckpointComponent(
         LocalLanceStorageFactory(),
         component_id=component_id,
-        weight_group=weight_group,
+        output_path=output_path,
         lineage_name=lineage_name,
         load_optimizer_state=load_optimizer_state,
         mode=mode,

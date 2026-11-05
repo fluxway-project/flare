@@ -770,7 +770,7 @@ def get_sparse_embedding_class(
             sparse_checkpoint_registration(
                 component_id=f"{gname}_embedding",
                 lineage_name=f"{gname}.embedding",
-                weight_group=gname,
+                output_path=f"sparse/{gname}",
                 backend=ckpt_backend,
                 load_optimizer_state=load_optimizer_state,
                 mode=CheckpointSaveMode.INCREMENTAL,
