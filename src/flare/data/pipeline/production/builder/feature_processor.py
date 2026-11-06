@@ -35,7 +35,11 @@ from .cross.base import get_fea_factory, get_fid_factory
 from .cross.fid_ops import FidCrossExpr as FidCrossNExpr
 from .cross.protocol import FeaCrossExpr, FidCrossExpr
 from .encoding.base import EncoderExpr
-from .encoding.dense import AutoCategoryEncoderExpr, CategoryEncoderExpr
+from .encoding.dense import (
+    AutoCategoryEncoderExpr,
+    CategoryEncoderExpr,
+    category_index_column,
+)
 from .encoding.protocol import output_kind_pa_type
 from .section import (
     AsItIsSection,
@@ -112,7 +116,7 @@ class FeatureProcessor:
         model_config_json: str,
         category_feature_dir: str | None = None,
         *,
-        category_values: Mapping[str, Mapping[int, int]] | None = None,
+        category_values: Mapping[str, Mapping[str, int]] | None = None,
         auto_category_features: Iterable[str] = (),
         model_input_feature_names: Iterable[str] | None = None,
         metadata_columns: Mapping[str, int] | None = None,
@@ -280,7 +284,12 @@ class FeatureProcessor:
         for code in sorted(self._post_fid_category_codes):
             definition = self._definitions[code]
             specs.append(
-                (definition.name, code, definition.length, self._code_to_encoder[code])
+                (
+                    category_index_column(code),
+                    code,
+                    definition.length,
+                    self._code_to_encoder[code],
+                )
             )
         return specs
 
@@ -297,10 +306,11 @@ class FeatureProcessor:
                 continue
             if not getattr(encoder, "requires_base_encode", True):
                 continue
-            if isinstance(encoder, CategoryEncoderExpr) and (
-                legacy_fid_stage or code in self._post_fid_category_codes
-            ):
-                encoder = AutoCategoryEncoderExpr()
+            if isinstance(encoder, CategoryEncoderExpr):
+                if legacy_fid_stage or code in self._post_fid_category_codes:
+                    encoder = AutoCategoryEncoderExpr()
+                else:
+                    feat_name = category_index_column(code)
             specs.append((feat_name, code, definition.length, encoder))
         return specs
 
@@ -477,6 +487,20 @@ class FeatureProcessor:
             return self._code_to_encoder[code]
         except KeyError as exc:
             raise ValueError(f"feature code {code} has no encoder") from exc
+
+    def build_category_parser_inputs(
+        self,
+    ) -> tuple[dict[int, dict[str, int]], dict[int, int]]:
+        mappings: dict[int, dict[str, int]] = {}
+        defaults: dict[int, int] = {}
+        for code, encoder in self._code_to_encoder.items():
+            if (
+                isinstance(encoder, CategoryEncoderExpr)
+                and not self._definitions[code].is_cross
+            ):
+                mappings[code] = dict(encoder.mapping)
+                defaults[code] = encoder.default_index
+        return mappings, defaults
 
     # ------------------------------------------------------------------
     # Internal loaders / resolvers
@@ -782,7 +806,7 @@ class FeatureProcessor:
         model_config_bytes: bytes,
         model_input_names: frozenset[str],
         cross_paths: Sequence[Path],
-        category_values: Mapping[str, Mapping[int, int]],
+        category_values: Mapping[str, Mapping[str, int]],
         auto_category_features: frozenset[str],
         required_names: set[str],
         encoder_groups: Mapping[str, FeatureGroup],

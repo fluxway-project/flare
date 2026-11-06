@@ -8,12 +8,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from flare.data.contracts.constants import (
-    DEFAULT_FLOAT_NULL_SENTINEL,
-    DEFAULT_NULL_SENTINEL,
-)
 from flare.data.pipeline.production.processing.parser_spec import ParserSpec
 
+from .encoding.dense import category_index_column
 from .feature_processor import FeatureProcessor
 
 
@@ -55,11 +52,26 @@ class RowParser:
                 feature.name,
                 feature.length,
                 feature.is_float,
-                -3.0 if feature.is_float else -3,
+                parser_spec.float_null_sentinel if feature.is_float else parser_spec.null_sentinel,
                 np.float32 if feature.is_float else np.int64,
             )
             for feature in parser_spec.features
         }
+        fast_parse = self._require_fast_parse_extension()
+        self._category_table = None
+        if parser_spec.category_mappings:
+            self._category_table = fast_parse.CategoryTable(
+                parser_spec.category_mappings,
+                parser_spec.category_defaults,
+            )
+        metadata_slots = tuple(
+            sorted(parser_spec.metadata_column_index.items(), key=lambda item: item[1])
+        )
+        self._metadata_slots = metadata_slots
+        self._metadata_table = fast_parse.MetadataTable(
+            metadata_slots,
+            self._metadata_maps,
+        )
         self._column_count = self._required_column_count()
 
     def _require_fast_parse_extension(self):
@@ -108,8 +120,6 @@ class RowParser:
             data_buf = np.empty(0, dtype=np.uint8)
 
         direct_cols = self._spec.direct_column_index
-        meta_cols = self._spec.metadata_column_index
-        metadata_slots = tuple(sorted(meta_cols.items(), key=lambda item: item[1]))
         payload_index = self._spec.feature_payload_column_index
         if payload_index is None:
             raise ValueError("the compiled parser requires a feature payload column")
@@ -121,10 +131,13 @@ class RowParser:
             tuple(sorted(direct_cols.items(), key=lambda item: item[1])),
             self._column_count,
             payload_index,
-            metadata_slots,
-            self._metadata_maps,
+            self._metadata_slots,
+            self._metadata_table,
             feature_buffers,
             meta_ints,
+            self._category_table,
+            self._spec.null_sentinel,
+            self._spec.float_null_sentinel,
         )
 
     def parse_to_table(self, col: pa.ChunkedArray) -> pa.Table:
@@ -139,23 +152,49 @@ class RowParser:
         self, batch_size: int
     ) -> tuple[FeatureBuffers, dict[str, np.ndarray]]:
         feature_buffers = FeatureBuffers({})
-        for name, length, is_float in self._feature_meta.values():
-            dtype = np.float32 if is_float else np.int64
-            pad = (
-                np.float32(DEFAULT_FLOAT_NULL_SENTINEL)
-                if is_float
-                else np.int64(DEFAULT_NULL_SENTINEL)
-            )
-            if length == 1:
-                feature_buffers[name] = np.full(batch_size, pad, dtype=dtype)
-                feature_buffers.scalar_validity[name] = np.zeros(
-                    batch_size, dtype=np.uint8
+        schema_names = set(self._spec.raw_schema.names)
+        for feature in self._spec.features:
+            has_cat = feature.code in self._spec.category_mappings
+            cat_name = category_index_column(feature.code) if has_cat else None
+            needs_num = feature.name in schema_names
+            shared_offsets = None
+
+            if needs_num:
+                dtype = np.float32 if feature.is_float else np.int64
+                pad = (
+                    np.float32(self._spec.float_null_sentinel)
+                    if feature.is_float
+                    else np.int64(self._spec.null_sentinel)
                 )
-            else:
-                feature_buffers[name] = (
-                    np.empty(batch_size * length, dtype=dtype),
-                    np.zeros(batch_size + 1, dtype=np.int32),
-                )
+                if feature.length == 1:
+                    feature_buffers[feature.name] = np.full(batch_size, pad, dtype=dtype)
+                    feature_buffers.scalar_validity[feature.name] = np.zeros(
+                        batch_size, dtype=np.uint8
+                    )
+                else:
+                    shared_offsets = np.zeros(batch_size + 1, dtype=np.int32)
+                    feature_buffers[feature.name] = (
+                        np.empty(batch_size * feature.length, dtype=dtype),
+                        shared_offsets,
+                    )
+
+            if has_cat:
+                default_idx = self._spec.category_defaults[feature.code]
+                if feature.length == 1:
+                    feature_buffers[cat_name] = np.full(
+                        batch_size, default_idx, dtype=np.int32
+                    )
+                    feature_buffers.scalar_validity[cat_name] = np.ones(
+                        batch_size, dtype=np.uint8
+                    )
+                else:
+                    if shared_offsets is None:
+                        shared_offsets = np.zeros(batch_size + 1, dtype=np.int32)
+                    feature_buffers[cat_name] = (
+                        np.zeros(batch_size * feature.length, dtype=np.int32),
+                        shared_offsets,
+                    )
+
         metadata = {
             name: np.zeros(batch_size, dtype=np.int32)
             for name in self._spec.metadata_column_index
@@ -163,95 +202,15 @@ class RowParser:
         for name in self._spec.direct_column_index:
             if name not in feature_buffers:
                 feature_buffers[name] = np.full(
-                    batch_size, DEFAULT_NULL_SENTINEL, dtype=np.int64
+                    batch_size, self._spec.null_sentinel, dtype=np.int64
                 )
                 feature_buffers.scalar_validity[name] = np.zeros(
                     batch_size, dtype=np.uint8
                 )
         return feature_buffers, metadata
 
-    def _parse_record(
-        self,
-        line: str,
-        row_index: int,
-        feature_buffers: FeatureBuffers,
-        metadata: dict[str, np.ndarray],
-        cursors: dict[str, int],
-    ) -> None:
-        columns = line.rstrip("\n").split("\t")
-        if len(columns) < self._column_count:
-            raise ValueError(
-                f"record has {len(columns)} columns, expected at least {self._column_count}"
-            )
-        for name, column_index in self._spec.direct_column_index.items():
-            value = columns[column_index]
-            if value and value != "0":
-                feature_buffers[name][row_index] = _parse_integer(value)
-                feature_buffers.scalar_validity[name][row_index] = 1
-        for name, column_index in self._spec.metadata_column_index.items():
-            value = columns[column_index]
-            try:
-                metadata[name][row_index] = self._metadata_maps[name][value]
-            except KeyError as exc:
-                raise KeyError(f"unknown metadata value for {name}: {value!r}") from exc
-        payload_index = self._spec.feature_payload_column_index
-        if payload_index is None:
-            return
-        payload = columns[payload_index]
-        if not payload:
-            return
-        for item in payload.split("\x02"):
-            if not item or "\x03" not in item:
-                continue
-            code_text, raw_value = item.split("\x03", 1)
-            try:
-                code = int(code_text)
-            except ValueError:
-                continue
-            feature = self._feature_meta.get(code)
-            if feature is None:
-                continue
-            name, length, is_float = feature
-            value = raw_value.strip("[]")
-            if not value:
-                continue
-            values = value.split(",") if length > 1 else [value]
-            parsed = [
-                float(v) if is_float else _parse_integer(v) for v in values[:length]
-            ]
-            if length == 1:
-                feature_buffers[name][row_index] = parsed[0]
-                feature_buffers.scalar_validity[name][row_index] = 1
-            else:
-                flat, _offsets = feature_buffers[name]
-                start = cursors[name]
-                end = start + len(parsed)
-                if end > flat.size:
-                    raise ValueError(
-                        f"feature {name!r} exceeds configured vector capacity {length}"
-                    )
-                flat[start:end] = parsed
-                cursors[name] = end
-
     def raw_arrow_schema(self) -> pa.Schema:
-        fields: list[pa.Field] = []
-        for name, length, is_float in self._feature_meta.values():
-            value_type = pa.float32() if is_float else pa.int64()
-            fields.append(
-                pa.field(name, value_type if length == 1 else pa.list_(value_type))
-            )
-        feature_names = {value[0] for value in self._feature_meta.values()}
-        for name in self._spec.direct_column_index:
-            if name not in feature_names:
-                fields.append(pa.field(name, pa.int64()))
-        for name in self._spec.metadata_column_index:
-            fields.append(pa.field(name, pa.int32()))
-        schema = pa.schema(fields)
-        if not schema.equals(self._spec.raw_schema, check_metadata=True):
-            raise RuntimeError(
-                "parser runtime schema differs from compiled parser spec"
-            )
-        return schema
+        return self._spec.raw_schema
 
 
 def _raw_features_to_arrow(
@@ -283,16 +242,6 @@ def _raw_features_to_arrow(
     return pa.table(arrays, schema=schema)
 
 
-def _parse_integer(value: str) -> int:
-    try:
-        return int(value)
-    except ValueError:
-        decimal = float(value)
-        if not decimal.is_integer():
-            raise ValueError(f"integer feature value is not integral: {value!r}")
-        return int(decimal)
-
-
 def _load_model_input_feature_names(model_conf_dir: Path) -> list[str]:
     import importlib.util
 
@@ -319,7 +268,7 @@ def build_feature_processor(
     conf_dir: Path,
     model_conf_dir: Path,
     metadata_columns: Mapping[str, int] | None = None,
-    category_values: Mapping[str, Mapping[int, int]] | None = None,
+    category_values: Mapping[str, Mapping[str, int]] | None = None,
     auto_category_features: Iterable[str] = (),
 ) -> FeatureProcessor:
     feature_tsv = conf_dir / "conf_common" / "feature.tsv"

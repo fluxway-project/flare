@@ -45,7 +45,7 @@ class ProcessingArtifactCompiler:
         conf_dir: Path,
         model_conf_dir: Path,
         parser_contract: ParserContract,
-        category_values: Mapping[str, Mapping[int, int]] | None = None,
+        category_values: Mapping[str, Mapping[str, int]] | None = None,
         auto_category_features: frozenset[str] = frozenset(),
     ) -> FeatureProcessingArtifact:
         processor = build_feature_processor(
@@ -55,11 +55,16 @@ class ProcessingArtifactCompiler:
             category_values=category_values,
             auto_category_features=auto_category_features,
         )
+        category_mappings, category_defaults = processor.build_category_parser_inputs()
         parser_spec = build_parser_spec(
             processor,
+            category_mappings=category_mappings,
+            category_defaults=category_defaults,
             metadata_columns=parser_contract.metadata_columns,
             direct_columns=parser_contract.direct_columns,
             feature_payload_column_index=parser_contract.feature_payload_column_index,
+            null_sentinel=parser_contract.null_sentinel,
+            float_null_sentinel=parser_contract.float_null_sentinel,
         )
         output_schema = processor.build_vortex_schema()
         plan = ExprPlan(

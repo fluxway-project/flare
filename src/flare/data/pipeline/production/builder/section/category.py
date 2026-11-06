@@ -20,7 +20,7 @@ class CategorySection(FeatureSection):
 
     def __init__(
         self,
-        category_values: Mapping[str, Mapping[int, int]],
+        category_values: Mapping[str, Mapping[str, int]],
         auto_features: frozenset[str],
     ):
         self._category_values = {

@@ -74,7 +74,7 @@ class RayDataPipeline:
         model_conf_dir: str | None = None,
         parser_contract: ParserContract | None = None,
         artifact: FeatureProcessingArtifact | None = None,
-        category_values: Mapping[str, Mapping[int, int]] | None = None,
+        category_values: Mapping[str, Mapping[str, int]] | None = None,
         auto_category_features: frozenset[str] = frozenset(),
         log_ray_data_stats: bool = False,
         source_provider: PartitionedSourceProvider | None = None,

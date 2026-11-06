@@ -46,19 +46,6 @@ def _numba_map_fixed_width(values, width, default_value, out):
             out[i] = int(value / width)
 
 
-@numba.njit(nogil=True, cache=True)
-def _numba_map_categorical(
-    values, sorted_keys, sorted_vals, default_val, fallback_idx, out
-):
-    for i in range(len(values)):
-        v = values[i]
-        idx = np.searchsorted(sorted_keys, v)
-        if idx < fallback_idx and sorted_keys[idx] == v:
-            out[i] = sorted_vals[idx]
-        else:
-            out[i] = default_val
-
-
 @dataclass(frozen=True, slots=True)
 class BucketPartition:
     thresholds: tuple[float, ...]
@@ -262,44 +249,26 @@ class FixedWidthBucketEncoderExpr(EncoderExpr):
         return pa.chunked_array([_process_chunk(chunk) for chunk in arr.chunks])
 
 
+def category_index_column(feature_code: int) -> str:
+    return f"category_index_{feature_code}"
+
+
 @dataclass(frozen=True, slots=True)
 class CategoryLookupTable:
-    mapping: MappingProxyType[int, int]
-    sorted_keys: np.ndarray = field(repr=False, compare=False)
-    sorted_vals: np.ndarray = field(repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.mapping, MappingProxyType):
-            raise TypeError("category mapping must be a MappingProxyType")
-        if not isinstance(self.sorted_keys, np.ndarray) or not isinstance(
-            self.sorted_vals, np.ndarray
-        ):
-            raise TypeError("category derived arrays must be NumPy arrays")
-        if self.sorted_keys.flags.writeable or self.sorted_vals.flags.writeable:
-            raise ValueError("category derived arrays must be read-only")
+    mapping: MappingProxyType[str, int]
 
     @classmethod
-    def from_mapping(
-        cls, mapping: Mapping[int, int], default_index: int = 0
-    ) -> CategoryLookupTable:
-        canonical_mapping = MappingProxyType(
-            {int(key): int(value) for key, value in mapping.items()}
-        )
-        indices = (default_index, *canonical_mapping.values())
-        if min(indices) < 0 or max(indices) > _INT32_MAX:
+    def from_mapping(cls, mapping: Mapping[str, int]) -> CategoryLookupTable:
+        if not mapping:
+            raise ValueError("category mapping must not be empty")
+        if any(type(key) is not str or not key for key in mapping):
+            raise TypeError("category vocabulary keys must be non-empty strings")
+        if any(
+            type(value) is not int or value < 0 or value > _INT32_MAX
+            for value in mapping.values()
+        ):
             raise ValueError("category indices must fit the non-negative int32 domain")
-        keys = np.array(list(canonical_mapping.keys()), dtype=np.int64)
-        vals = np.array(list(canonical_mapping.values()), dtype=np.int32)
-        sort_idx = np.argsort(keys)
-        sorted_keys = keys[sort_idx]
-        sorted_vals = vals[sort_idx]
-        sorted_keys.flags.writeable = False
-        sorted_vals.flags.writeable = False
-        return cls(
-            mapping=canonical_mapping,
-            sorted_keys=sorted_keys,
-            sorted_vals=sorted_vals,
-        )
+        return cls(mapping=MappingProxyType(dict(mapping)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,9 +280,15 @@ class CategoryEncoderExpr(EncoderExpr):
     def __post_init__(self) -> None:
         if not isinstance(self.table, CategoryLookupTable):
             raise TypeError("table must be a CategoryLookupTable")
+        if (
+            type(self.default_index) is not int
+            or self.default_index < 0
+            or self.default_index > _INT32_MAX
+        ):
+            raise ValueError("category default must fit the non-negative int32 domain")
 
     @property
-    def mapping(self) -> MappingProxyType[int, int]:
+    def mapping(self) -> MappingProxyType[str, int]:
         return self.table.mapping
 
     def encoded_default(self, feature_code: int) -> int:
@@ -333,50 +308,19 @@ class CategoryEncoderExpr(EncoderExpr):
         slot: int,
         length: int,
     ) -> pa.ChunkedArray | None:
-        is_list = length > 1
-        arr = table.column(col_name).cast(
-            pa.list_(pa.int64()) if is_list else pa.int64(), safe=False
-        )
-        fallback_idx = len(self.table.sorted_keys)
-
-        def _process_chunk(col):
-            flat = col.flatten() if is_list else col
-
-            if flat.null_count > 0:
-                flat_filled = pc.fill_null(flat, 0)
-            else:
-                flat_filled = flat
-
-            flat_np = flat_filled.to_numpy(zero_copy_only=False)
-            num_items = len(flat_np)
-            out_buf = pa.allocate_buffer(num_items * 4)
-            out_np = np.frombuffer(out_buf, dtype=np.int32)
-            _numba_map_categorical(
-                flat_np,
-                self.table.sorted_keys,
-                self.table.sorted_vals,
-                self.default_index,
-                fallback_idx,
-                out_np,
+        expected_name = category_index_column(slot)
+        if col_name != expected_name:
+            raise ValueError(
+                f"category index input must be {expected_name!r}, got {col_name!r}"
             )
-
-            out_flat = pa.Array.from_buffers(pa.int32(), num_items, [None, out_buf])
-
-            if is_list:
-                if isinstance(col.type, pa.FixedSizeListType):
-                    return pa.FixedSizeListArray.from_arrays(out_flat, length)
-                else:
-                    shifted_offsets = pc.call_function(
-                        "subtract", [col.offsets, col.offsets[0]]
-                    )
-                    return pa.ListArray.from_arrays(shifted_offsets, out_flat)
-            else:
-                return out_flat
-
-        res_chunks = []
-        for chunk in arr.chunks:
-            res_chunks.append(_process_chunk(chunk))
-        return pa.chunked_array(res_chunks)
+        expected_type = pa.list_(pa.int32()) if length > 1 else pa.int32()
+        values = table.column(col_name)
+        if values.type != expected_type:
+            raise TypeError(
+                f"category index input {col_name!r} must be {expected_type}, "
+                f"got {values.type}"
+            )
+        return values
 
 
 @dataclass(frozen=True, slots=True)

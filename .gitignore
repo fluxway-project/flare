@@ -8,8 +8,8 @@ xla*/
 # Cython-generated C sources (must not be committed: stale .c causes cythonize
 # to skip re-transpilation on remote workers, producing a .so built from an old
 # version of the .pyx)
-dataset/builder/_fast_parse.c
-src/flare/data/processing/native/_scan.c
+src/flare/data/pipeline/production/builder/_fast_parse.c
+src/flare/data/pipeline/production/processing/native/_scan.c
 
 # Caches and temporary files
 .pytest_cache/

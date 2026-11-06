@@ -62,7 +62,7 @@ SLOT_AGE_DIFF = 5
 SLOT_PROFILE = 6
 
 BUCKET_BOUNDS = [10.0, 20.0, 30.0, 40.0, 50.0]
-CATEGORY_MAPPING = {100: 1, 200: 2, 300: 3}
+CATEGORY_MAPPING = {"100": 1, "200": 2, "300": 3}
 CATEGORY_DEFAULT = 0
 
 
@@ -72,13 +72,18 @@ def make_synthetic_batch(batch_size: int, *, seed: int = 0) -> pa.Table:
     Includes one ``unused_col`` to exercise projection pruning.
     """
     rng = np.random.default_rng(seed)
+    age = rng.uniform(18, 60, batch_size).astype(np.float32)
+    exp_years = rng.uniform(0, 30, batch_size).astype(np.float32)
+    city = rng.choice(np.array([100, 200, 300, 999], dtype=np.int32), batch_size)
+    city_indexes = np.zeros(batch_size, dtype=np.int32)
+    for value, index in CATEGORY_MAPPING.items():
+        city_indexes[city == int(value)] = index
     return pa.table(
         {
-            "age": rng.uniform(18, 60, batch_size).astype(np.float32),
-            "exp_years": rng.uniform(0, 30, batch_size).astype(np.float32),
-            "city": rng.choice(
-                np.array([100, 200, 300, 999], dtype=np.int32), batch_size
-            ),
+            "age": age,
+            "exp_years": exp_years,
+            "city": city,
+            "category_index_1": city_indexes,
             "entity_id": rng.integers(1, 10_000_000, batch_size, dtype=np.int64),
             "salary": rng.uniform(3000, 50000, batch_size).astype(np.float32),
             "profile_level": rng.integers(0, 1000, batch_size, dtype=np.int64),
@@ -91,9 +96,7 @@ def build_plan() -> ExprPlan:
     """Construct a representative plan exercising every encoder family + a cross."""
     bucket_enc = BucketEncoderExpr(partition=BucketPartition.from_bounds(BUCKET_BOUNDS))
     category_enc = CategoryEncoderExpr(
-        table=CategoryLookupTable.from_mapping(
-            CATEGORY_MAPPING, default_index=CATEGORY_DEFAULT
-        ),
+        table=CategoryLookupTable.from_mapping(CATEGORY_MAPPING),
         default_index=CATEGORY_DEFAULT,
     )
     as_it_is_enc = AsItIsEncoderExpr()
@@ -104,7 +107,7 @@ def build_plan() -> ExprPlan:
 
     encode_specs: list[tuple[str, int, int, Any]] = [
         ("age", SLOT_AGE, 1, bucket_enc),
-        ("city", SLOT_CITY, 1, category_enc),
+        ("category_index_1", SLOT_CITY, 1, category_enc),
         ("entity_id", SLOT_ENTITY, 1, as_it_is_enc),
         ("salary", SLOT_SALARY, 1, float_enc),
         ("age_diff", SLOT_AGE_DIFF, 1, float_enc),
@@ -217,7 +220,9 @@ class TestExprPlanCorrectness:
         recent = result.column(f"fid_{recent_slot}").combine_chunks()
         auto_recent = result.column(f"fid_{auto_slot}").combine_chunks()
 
-        assert pc.list_value_length(recent).to_pylist() == [  # pyrefly: ignore[missing-attribute]
+        assert pc.list_value_length(
+            recent
+        ).to_pylist() == [  # pyrefly: ignore[missing-attribute]
             1,
             2,
             1,
@@ -228,7 +233,9 @@ class TestExprPlanCorrectness:
             sparse_fid_i64(recent_slot) | 456,
             encoded_missing_for(FeatureOutputKind.SPARSE_I64_FIDS, recent_slot),
         ]
-        assert pc.list_value_length(auto_recent).to_pylist() == [  # pyrefly: ignore[missing-attribute]
+        assert pc.list_value_length(
+            auto_recent
+        ).to_pylist() == [  # pyrefly: ignore[missing-attribute]
             1,
             1,
             2,
@@ -268,7 +275,7 @@ class TestExprPlanCorrectness:
         for required in (
             "age",
             "exp_years",
-            "city",
+            "category_index_1",
             "entity_id",
             "salary",
             "profile_level",
@@ -352,7 +359,9 @@ class TestFidCrossDtype:
         result = plan.transform(batch)
         crossed = result.column(f"fid_{cross_slot}").combine_chunks()
 
-        assert pc.list_value_length(crossed).to_pylist() == [  # pyrefly: ignore[missing-attribute]
+        assert pc.list_value_length(
+            crossed
+        ).to_pylist() == [  # pyrefly: ignore[missing-attribute]
             0,
             1,
         ]

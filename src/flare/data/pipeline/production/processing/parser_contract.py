@@ -13,6 +13,8 @@ class ParserContract:
     metadata_columns: Mapping[str, int]
     metadata_maps: Mapping[str, Mapping[str, int]]
     feature_payload_column_index: int
+    null_sentinel: int
+    float_null_sentinel: float
 
     def __post_init__(self) -> None:
         if not isinstance(self.direct_columns, MappingProxyType):
@@ -21,6 +23,10 @@ class ParserContract:
             raise TypeError("metadata_columns must be a MappingProxyType")
         if not isinstance(self.metadata_maps, MappingProxyType):
             raise TypeError("metadata_maps must be a MappingProxyType")
+        if type(self.null_sentinel) is not int:
+            raise TypeError("null_sentinel must be an int")
+        if type(self.float_null_sentinel) is not float:
+            raise TypeError("float_null_sentinel must be a float")
         direct = self.direct_columns
         metadata = self.metadata_columns
         maps = self.metadata_maps

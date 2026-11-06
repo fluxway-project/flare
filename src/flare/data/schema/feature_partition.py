@@ -18,7 +18,7 @@ def compile_feature_partition(
     *,
     conf_root: Path,
     model_conf_dir: Path,
-    category_values: Mapping[str, Mapping[int, int]] | None = None,
+    category_values: Mapping[str, Mapping[str, int]] | None = None,
     auto_category_features: Iterable[str] = (),
 ) -> FeaturePartition:
     from flare.data.pipeline.production.builder.row_parser import (

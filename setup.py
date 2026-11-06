@@ -11,7 +11,7 @@ ext_modules = cythonize(
         Extension(
             "flare.data.pipeline.production.builder._fast_parse",
             ["src/flare/data/pipeline/production/builder/_fast_parse.pyx"],
-            extra_compile_args=["-Ofast", "-march=native", "-funroll-loops"],
+            extra_compile_args=["-O3", "-march=native", "-funroll-loops"],
         ),
     ],
     compiler_directives={

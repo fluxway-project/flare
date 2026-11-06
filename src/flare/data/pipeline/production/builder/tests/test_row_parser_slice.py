@@ -26,6 +26,8 @@ def test_arrow_slice_preserves_selected_rows(arrow_type, chunked):
         direct_column_index={"id": 0},
         metadata_column_index={"label": 1},
         feature_payload_column_index=2,
+        null_sentinel=-3,
+        float_null_sentinel=-3.0,
     )
     parser = RowParser(spec, {"label": {"a": 0, "b": 1}})
     lines = pa.array(

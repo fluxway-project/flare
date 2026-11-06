@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 from flare.data.pipeline.production.builder.encoding.protocol import MASK_48
+from flare.data.pipeline.production.builder.encoding.dense import CategoryLookupTable
 from flare.data.pipeline.production.builder.expr_plan import ExprPlan
 from flare.data.pipeline.production.builder.feature_processor import FeatureProcessor
 from flare.data.schema.feature_catalog import FeatureOutputKind
@@ -40,6 +41,11 @@ def write_config(tmp_path, *, as_it_is: list[str]) -> tuple[str, str, str]:
         encoding="utf-8",
     )
     return str(feature_tsv), str(model_config), str(category_dir)
+
+
+def test_category_lookup_requires_exact_lexeme_strings() -> None:
+    with pytest.raises(TypeError, match="category vocabulary keys must be non-empty strings"):
+        CategoryLookupTable.from_mapping({0.5: 3})
 
 
 def test_cross_definitions_are_keyed_by_code_not_display_name(tmp_path) -> None:
@@ -161,7 +167,7 @@ def test_recipe_category_mapping_is_scoped_to_model_features(tmp_path) -> None:
     processor = FeatureProcessor(
         feature_tsv,
         model_config,
-        category_values={"selected": {10: 0}},
+        category_values={"selected": {"10": 0}},
         model_input_feature_names=["selected"],
     )
 
@@ -185,7 +191,7 @@ def test_category_sequence_schema_uses_dense_indices(tmp_path) -> None:
     processor = FeatureProcessor(
         feature_tsv,
         model_config,
-        category_values={"context_category_codes": {-3: 0, 0: 1, 100101: 2}},
+        category_values={"context_category_codes": {"-3": 0, "0": 1, "100101": 2}},
         model_input_feature_names=["context_category_codes"],
     )
 
@@ -246,7 +252,7 @@ def test_explicit_encoder_precedes_as_it_is_and_auto(
     payload["category_file"] = {"raw_id": "auto"}
     payload[config_key] = {"raw_id": config_value}
     if config_key == "category_file":
-        category_values = {"raw_id": {10: 0, 20: 1}}
+        category_values = {"raw_id": {"10": 0, "20": 1}}
     else:
         category_values = None
     (tmp_path / "model_config.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -280,7 +286,7 @@ def test_dictionary_category_is_mapped_after_fid_cross(tmp_path) -> None:
     processor = FeatureProcessor(
         feature_tsv,
         model_config,
-        category_values={"category": {-3: 0, 10: 1, 20: 2}},
+        category_values={"category": {"-3": 0, "10": 1, "20": 2}},
         auto_category_features={"other"},
         model_input_feature_names=["category-other"],
     )
@@ -290,7 +296,13 @@ def test_dictionary_category_is_mapped_after_fid_cross(tmp_path) -> None:
     )
 
     output_cols = ["fid_1", "fid_2", "fid_3"]
-    batch = pa.table({"category": [10], "other": [2]})
+    batch = pa.table(
+        {
+            "category": [10],
+            "category_index_1": pa.array([1], type=pa.int32()),
+            "other": [2],
+        }
+    )
     production_plan = ExprPlan(
         processor.build_fea_cross_ops(),
         processor.build_encode_specs(),

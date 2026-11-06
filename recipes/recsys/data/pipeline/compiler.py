@@ -10,7 +10,7 @@ from flare.data.pipeline.production.processing.artifact import (
 from flare.data.pipeline.production.processing.parser_contract import ParserContract
 
 CategoryLoader = Callable[
-    [Path, Path], tuple[Mapping[str, Mapping[int | float, int]], frozenset[str]]
+    [Path, Path], tuple[Mapping[str, Mapping[str, int]], frozenset[str]]
 ]
 
 
