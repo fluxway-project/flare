@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal
 
+import numpy as np
 from fluxway.common.logical_partition_binding import LogicalPartitionBinding
 from fluxway.common.mesh import DeviceMesh
 from fluxway.control_plane.graph.functional import FunctionalGraph, NodeProxy
@@ -16,6 +17,7 @@ from flare.mesh import (
 )
 from flare.runtime.fluxway.placement import build_affinity_placement
 from flare.runtime.sparse_restore import build_sparse_restore_plans
+from flare.training.execution import OptimizerUpdateWindow
 from recipes.recsys.ranking.schema.sparse_features import parse_sparse_group_name
 
 
@@ -38,6 +40,28 @@ class RankingTrainingAssemblyConfig:
     metrics_static_args: Mapping[str, Any] | None
     compute_spmd_name: str
     metrics_spmd_name: str
+
+
+def _should_apply_dense_update(result: Any) -> bool:
+    """Run the dense update operator only for windows that mutate weights.
+
+    Fluxway evaluates dependency conditions on the producer's ExecutionResult.
+    The token is emitted by train_core and is always either a transport tensor
+    or its scalar payload.  Returning SKIP for non-boundary microsteps keeps the
+    update phase remains visible to the phase scheduler for boundary ordering;
+    skipped virtual steps still complete the phase but avoid dispatching the
+    Python/JAX update callable when it cannot change weights.
+    """
+    data = getattr(result, "data", result)
+    if isinstance(data, Mapping):
+        encoded = data["optimizer_update_window"]
+    else:
+        encoded = data.optimizer_update_window
+    payload = getattr(encoded, "flat_values", encoded)
+    window = OptimizerUpdateWindow.decode(
+        np.asarray(payload, dtype=np.int64).reshape(-1)
+    )
+    return window.should_apply_update
 
 
 def bind_sparse_embedding_restore_plans(
@@ -141,9 +165,6 @@ def _training_handles(
         bind_kwargs[f"sparse_input_{group}"] = getattr(
             materialized, f"sparse_input_{group}"
         )
-        bind_kwargs[f"padded_inverse_{group}"] = getattr(
-            materialized, f"padded_inverse_{group}"
-        )
     for group in side_info_groups:
         bind_kwargs[group] = getattr(materialized, group)
     jax_bound = node.prepare_jax_bind(**bind_kwargs, local=True)
@@ -160,7 +181,9 @@ def _training_handles(
         optimizer_update_window=core.optimizer_update_window,
         local=True,
     )
-    scatter_kwargs: dict[str, Any] = {}
+    scatter_kwargs: dict[str, Any] = {
+        "optimizer_update_window": core.optimizer_update_window,
+    }
     for group in sparse_groups:
         scatter_kwargs[f"grad_jax_{group}"] = getattr(core, f"grad_jax_{group}")
         scatter_kwargs[f"emb_ref_{group}"] = getattr(materialized, f"emb_ref_{group}")
@@ -168,7 +191,11 @@ def _training_handles(
             materialized, f"padded_inverse_{group}"
         )
     scattered = node.scatter_sparse_grads(**scatter_kwargs, local=True)
-    node.update(optimizer_update_window=core.optimizer_update_window, local=True)
+    node.update(
+        optimizer_update_window=core.optimizer_update_window,
+        condition_fn=_should_apply_dense_update,
+        local=True,
+    )
     return {
         "node": node,
         "materialized": materialized,
@@ -183,8 +210,7 @@ def _update_sparse_tables(
     *,
     tables: Mapping[str, Any],
     sparse_groups: tuple[str, ...],
-    scattered: Mapping[str, Any],
-    optimizer_update_window: Any,
+    scattered: Any,
 ) -> None:
     updates: dict[str, dict[str, Any]] = {}
     for group in sparse_groups:
@@ -196,7 +222,7 @@ def _update_sparse_tables(
         if base_name not in tables:
             raise KeyError(f"missing sparse table for group {base_name!r}")
         tables[base_name].update(
-            **gradients, optimizer_update_window=optimizer_update_window
+            **gradients, optimizer_update_window=scattered.optimizer_update_window
         )
 
 
@@ -276,7 +302,6 @@ def add_ranking_training(
         tables=tables,
         sparse_groups=config.sparse_groups,
         scattered=training["scattered"],
-        optimizer_update_window=training["core"].optimizer_update_window,
     )
     return RankingTrainingHandles(
         training=training, metrics=metrics, training_node=training_node

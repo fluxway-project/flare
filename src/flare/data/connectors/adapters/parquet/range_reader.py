@@ -11,10 +11,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pyarrow.fs import FileSystem
 
+from flare.data.connectors.adapters.parquet.local_cache import LocalParquetFileCache
 from flare.data.schema.feature_catalog import validate_storage_columns
 from flare.io.aws import get_pyarrow_s3_fs
 
 STREAMING_READ_BATCH_ROWS = 65_536
+# A Reader retains one decoded row group; remote files are shared through a
+# bounded node-local cache so parallel Reader processes do not fetch them again.
+_ROW_GROUP_CACHE_BYTES = 2 * 1024**3
+_NODE_FILE_CACHE_BYTES = 16 * 1024**3
 
 
 class _CountingRandomAccessFile:
@@ -57,8 +62,16 @@ class CountedParquetFile:
 
     @classmethod
     def from_input_file(cls, input_file: Any) -> CountedParquetFile:
+        return cls.from_stream(input_file.open())
+
+    @classmethod
+    def from_stream(cls, raw: Any) -> CountedParquetFile:
         instance = cls.__new__(cls)
-        instance._initialize(input_file.open())
+        try:
+            instance._initialize(raw)
+        except BaseException:
+            raw.close()
+            raise
         return instance
 
     def _initialize(self, raw: Any) -> None:
@@ -101,6 +114,11 @@ class ParquetInputFileReadSession:
             raise ValueError("max_open_files must be a positive integer")
         self._source_identity = source_identity
         self._max_open_files = max_open_files
+        self._row_group_cache_bytes = _ROW_GROUP_CACHE_BYTES
+        self._local_file_cache: LocalParquetFileCache | None = None
+        self._row_group_cache_lock = RLock()
+        self._cached_row_group_key: tuple[str, str, tuple[str, ...], int] | None = None
+        self._cached_row_group: pa.Table | None = None
         self._opened_files: OrderedDict[tuple[str, str], CountedParquetFile] = (
             OrderedDict()
         )
@@ -147,7 +165,19 @@ class ParquetInputFileReadSession:
                 self._active_reads[key] = self._active_reads.get(key, 0) + 1
                 break
         try:
-            source = CountedParquetFile.from_input_file(input_file_factory())
+            if not locator.startswith("s3://"):
+                source = CountedParquetFile.from_input_file(input_file_factory())
+            else:
+                if self._local_file_cache is None:
+                    self._local_file_cache = LocalParquetFileCache(
+                        _NODE_FILE_CACHE_BYTES
+                    )
+                cached = self._local_file_cache.open_file(
+                    revision_identity=revision_identity,
+                    locator=locator,
+                    input_file_factory=input_file_factory,
+                )
+                source = CountedParquetFile.from_stream(cached)
         except BaseException:
             with self._state:
                 self._opening_files.remove(key)
@@ -211,6 +241,17 @@ class ParquetInputFileReadSession:
         key = (revision_identity, locator)
         try:
             with lock:
+                cached = self._read_cached_row_group(
+                    source,
+                    revision_identity=revision_identity,
+                    locator=locator,
+                    projection=projection,
+                    row_start=row_start,
+                    row_count=row_count,
+                )
+                if cached is not None:
+                    yield from cached.to_batches(max_chunksize=batch_size)
+                    return
                 for batch, _physical_bytes in iter_counted_parquet_file_range_batches(
                     source,
                     projection=projection,
@@ -221,6 +262,56 @@ class ParquetInputFileReadSession:
                     yield batch
         finally:
             self._release_source(key)
+
+    def _read_cached_row_group(
+        self,
+        source: CountedParquetFile,
+        *,
+        revision_identity: str,
+        locator: str,
+        projection: Sequence[str],
+        row_start: int,
+        row_count: int,
+    ) -> pa.Table | None:
+        if self._row_group_cache_bytes == 0 or row_start < 0 or row_count <= 0:
+            return None
+        requested = validate_storage_columns(projection)
+        if missing := sorted(set(requested) - set(source.parquet.schema_arrow.names)):
+            raise ValueError(f"Parquet source is missing columns: {missing}")
+        offsets = [0]
+        metadata = source.parquet.metadata
+        for group in range(metadata.num_row_groups):
+            offsets.append(offsets[-1] + int(metadata.row_group(group).num_rows))
+        end = row_start + row_count
+        if end > offsets[-1]:
+            return None
+        group = bisect_right(offsets, row_start) - 1
+        if end > offsets[group + 1]:
+            return None
+        if metadata.row_group(group).num_rows < 4 * row_count:
+            return None
+        if metadata.row_group(group).total_byte_size > self._row_group_cache_bytes:
+            return None
+        cache_key = (revision_identity, locator, requested, group)
+        with self._row_group_cache_lock:
+            table = (
+                self._cached_row_group
+                if self._cached_row_group_key == cache_key
+                else None
+            )
+        if table is None:
+            table = source.parquet.read_row_group(
+                group, columns=list(requested), use_threads=True
+            )
+            source.consume_bytes_delta()
+            if table.nbytes <= self._row_group_cache_bytes:
+                with self._row_group_cache_lock:
+                    self._cached_row_group_key = cache_key
+                    self._cached_row_group = table
+        selected = table.slice(row_start - offsets[group], row_count)
+        if tuple(selected.column_names) != requested:
+            raise ValueError("Parquet cached projection differs from requested columns")
+        return selected
 
     def close(self) -> None:
         with self._state:
@@ -237,6 +328,9 @@ class ParquetInputFileReadSession:
             )
             self._opened_files.clear()
             self._file_locks.clear()
+        with self._row_group_cache_lock:
+            self._cached_row_group_key = None
+            self._cached_row_group = None
         for lock, source in opened:
             with lock:
                 source.close()

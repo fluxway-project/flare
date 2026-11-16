@@ -3,10 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from fluxway.common.tensor_components import (
-    dense_path_strides,
-    fill_nested_dense_inv_with_pad,
-)
 
 from flare.kernels.conversion import to_host_array
 
@@ -91,17 +87,38 @@ def materialize_padded_inverse(
             raise ValueError(
                 f"Ragged inverse row count differs from batch for group {group!r}"
             )
-    splits = tuple(to_host_array(split, dtype=np.int32) for split in nested_splits)
+    splits = tuple(to_host_array(split, dtype=np.int64) for split in nested_splits)
     flat = to_host_array(flat_values)
     if audit:
         validate_inverse_range(flat, pad_index, group)
-    output = np.empty((batch_size, *target_widths), dtype=dtype)
-    fill_nested_dense_inv_with_pad(
-        flat.astype(dtype, copy=False),
-        splits,
-        dense_path_strides(target_widths).astype(np.int32, copy=False),
-        pad_index,
-        output,
+    if len(splits) != len(target_widths) or len(splits[0]) != batch_size + 1:
+        raise ValueError(f"Ragged inverse shape mismatch for group {group!r}")
+    # Validate offsets before indexing; unchecked native writes can corrupt a
+    # worker instead of reporting invalid transport metadata.
+    output = np.full((batch_size, *target_widths), pad_index, dtype=dtype)
+    positions = np.arange(batch_size, dtype=np.int64)
+    valid = np.ones(batch_size, dtype=bool)
+    for level, (split, width) in enumerate(zip(splits, target_widths, strict=True)):
+        expected_children = (
+            len(splits[level + 1]) - 1 if level + 1 < len(splits) else flat.size
+        )
+        if (
+            split.ndim != 1
+            or split.size != positions.size + 1
+            or split[0] != 0
+            or split[-1] != expected_children
+            or np.any(split[1:] < split[:-1])
+        ):
+            raise ValueError(
+                f"Invalid ragged inverse offsets for group {group!r} at level {level}"
+            )
+        lengths = np.diff(split)
+        parents = np.repeat(np.arange(positions.size), lengths)
+        local = np.arange(expected_children) - split[parents]
+        valid = valid[parents] & (local < width)
+        positions = positions[parents] * width + local
+    output.reshape(-1)[positions[valid]] = flat.reshape(-1)[valid].astype(
+        dtype, copy=False
     )
     return output
 

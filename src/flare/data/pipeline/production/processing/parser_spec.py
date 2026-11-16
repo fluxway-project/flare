@@ -152,10 +152,7 @@ def build_parser_spec(
             }
         ),
         category_defaults=MappingProxyType(
-            {
-                code: int(default_idx)
-                for code, default_idx in category_defaults.items()
-            }
+            {code: int(default_idx) for code, default_idx in category_defaults.items()}
         ),
         null_sentinel=null_sentinel,
         float_null_sentinel=float_null_sentinel,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from flare.ops.sparse_scatter import scatter_pooled_numba
 from recipes.recsys.ranking.schema.input import materialize_padded_inverse
@@ -55,3 +56,32 @@ def test_grouped_parallel_pooled_scatter_matches_duplicate_id_sum() -> None:
             row_in_batch = slot // (feature_count * max_elements)
             expected[row] += gradient[row_in_batch, feature]
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_inverse_rejects_offsets_outside_flat_buffer():
+    with pytest.raises(ValueError, match="Invalid ragged inverse offsets"):
+        materialize_padded_inverse(
+            np.array([1, 2], dtype=np.int32),
+            (np.array([0, 3], dtype=np.int32),),
+            (1, 3),
+            pad_index=9,
+            batch_size=1,
+            target_widths=(3,),
+            group="invalid",
+        )
+
+
+def test_inverse_truncation_cannot_write_into_next_row():
+    actual = materialize_padded_inverse(
+        np.array([1, 2, 3, 4, 5], dtype=np.int32),
+        (
+            np.array([0, 3, 4], dtype=np.int32),
+            np.array([0, 1, 2, 4, 5], dtype=np.int32),
+        ),
+        (2, 3, 2),
+        pad_index=9,
+        batch_size=2,
+        target_widths=(2, 1),
+        group="truncate",
+    )
+    np.testing.assert_array_equal(actual, np.array([[[1], [2]], [[5], [9]]]))

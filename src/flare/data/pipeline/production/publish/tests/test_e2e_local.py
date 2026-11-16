@@ -220,9 +220,7 @@ class TestExprPlanCorrectness:
         recent = result.column(f"fid_{recent_slot}").combine_chunks()
         auto_recent = result.column(f"fid_{auto_slot}").combine_chunks()
 
-        assert pc.list_value_length(
-            recent
-        ).to_pylist() == [  # pyrefly: ignore[missing-attribute]
+        assert pc.list_value_length(recent).to_pylist() == [  # pyrefly: ignore[missing-attribute]
             1,
             2,
             1,
@@ -233,9 +231,7 @@ class TestExprPlanCorrectness:
             sparse_fid_i64(recent_slot) | 456,
             encoded_missing_for(FeatureOutputKind.SPARSE_I64_FIDS, recent_slot),
         ]
-        assert pc.list_value_length(
-            auto_recent
-        ).to_pylist() == [  # pyrefly: ignore[missing-attribute]
+        assert pc.list_value_length(auto_recent).to_pylist() == [  # pyrefly: ignore[missing-attribute]
             1,
             1,
             2,
@@ -359,9 +355,7 @@ class TestFidCrossDtype:
         result = plan.transform(batch)
         crossed = result.column(f"fid_{cross_slot}").combine_chunks()
 
-        assert pc.list_value_length(
-            crossed
-        ).to_pylist() == [  # pyrefly: ignore[missing-attribute]
+        assert pc.list_value_length(crossed).to_pylist() == [  # pyrefly: ignore[missing-attribute]
             0,
             1,
         ]

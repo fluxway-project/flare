@@ -11,6 +11,38 @@ def _positive_worker_count(value: str, field: str) -> int:
     return count
 
 
+def _parse_sparse_counts(
+    arg_str: str,
+    sparse_groups: Iterable[str],
+    *,
+    scalar_label: str,
+    override_label: str,
+    default: int | None,
+) -> dict[str, int]:
+    if not isinstance(arg_str, str):
+        raise TypeError(f"{scalar_label} must be a string")
+    base_names = extract_sparse_base_names(sparse_groups)
+    config = {} if default is None else dict.fromkeys(base_names, default)
+    if not arg_str:
+        return config
+    if ":" not in arg_str:
+        value = _positive_worker_count(arg_str, scalar_label)
+        return dict.fromkeys(base_names, value)
+    configured: set[str] = set()
+    for item in arg_str.split(","):
+        fields = item.split(":")
+        if len(fields) != 2:
+            raise ValueError(f"{override_label} must use name:count, got {item!r}")
+        name, value = (field.strip() for field in fields)
+        if name not in base_names:
+            raise ValueError(f"unknown sparse group {name!r}")
+        if name in configured:
+            raise ValueError(f"duplicate sparse group {name!r}")
+        config[name] = _positive_worker_count(value, f"{scalar_label} for {name!r}")
+        configured.add(name)
+    return config
+
+
 def parse_sparse_group_name(group_name: str) -> tuple[str, int]:
     if not isinstance(group_name, str) or not group_name:
         raise ValueError(
@@ -72,30 +104,27 @@ def parse_sparse_workers(
     arg_str: str,
     sparse_groups: Iterable[str],
 ) -> dict[str, int]:
-    base_names = extract_sparse_base_names(sparse_groups)
-    config = dict.fromkeys(base_names, 1)
-    if not arg_str:
-        return config
-    if ":" not in arg_str:
-        worker_count = _positive_worker_count(arg_str, "sparse worker count")
-        return dict.fromkeys(base_names, worker_count)
-    configured = set()
-    for item in arg_str.split(","):
-        fields = item.split(":")
-        if len(fields) != 2:
-            raise ValueError(
-                f"sparse worker override must use name:count, got {item!r}"
-            )
-        name, value = (field.strip() for field in fields)
-        if name not in config:
-            raise ValueError(f"unknown sparse group {name!r}")
-        if name in configured:
-            raise ValueError(f"duplicate sparse group {name!r}")
-        config[name] = _positive_worker_count(
-            value, f"sparse worker count for {name!r}"
-        )
-        configured.add(name)
-    return config
+    return _parse_sparse_counts(
+        arg_str,
+        sparse_groups,
+        scalar_label="sparse worker count",
+        override_label="sparse worker override",
+        default=1,
+    )
+
+
+def parse_sparse_thread_budgets(
+    arg_str: str,
+    sparse_groups: Iterable[str],
+) -> dict[str, int]:
+    """Return explicit native thread budgets, leaving other groups at their default."""
+    return _parse_sparse_counts(
+        arg_str,
+        sparse_groups,
+        scalar_label="sparse thread budget",
+        override_label="sparse thread budget override",
+        default=None,
+    )
 
 
 def build_sparse_group_feature_widths(
@@ -135,5 +164,6 @@ __all__ = [
     "extract_sparse_base_names",
     "extract_sparse_groups_and_dimensions",
     "parse_sparse_group_name",
+    "parse_sparse_thread_budgets",
     "parse_sparse_workers",
 ]

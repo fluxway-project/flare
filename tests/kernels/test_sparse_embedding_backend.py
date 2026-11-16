@@ -99,6 +99,34 @@ def test_jax_backend_rejects_non_dlpack_embedding() -> None:
         )
 
 
+def test_cupy_imports_cuda_jax_gradient_without_host_conversion(monkeypatch):
+    backend = CupySparseEmbeddingOperator("float16", "float32")
+    source = jax.device_put(jax.numpy.arange(64, dtype=jax.numpy.bfloat16))
+    if source.__dlpack_device__()[0] != 2:
+        pytest.skip("requires CUDA JAX backend")
+
+    class CudaJaxValue:
+        def __jax_array__(self):
+            return source
+
+        def __dlpack_device__(self):
+            return source.__dlpack_device__()
+
+        def __dlpack__(self, **kwargs):
+            return source.__dlpack__(**kwargs)
+
+        def __array__(self, *args, **kwargs):
+            raise AssertionError("CUDA gradient must not be copied through NumPy")
+
+    actual = backend.array(CudaJaxValue())
+    backend.stream.synchronize()
+    assert actual.data.ptr == source.unsafe_buffer_pointer()
+    assert actual.dtype == cupy.dtype("bfloat16")
+    np.testing.assert_array_equal(
+        cupy.asnumpy(actual).astype(np.float32), np.arange(64)
+    )
+
+
 def test_sparse_backend_requires_explicit_gradient_dtype() -> None:
     with pytest.raises(TypeError):
         JaxSparseEmbeddingOperator(value_dtype="float16")
@@ -320,3 +348,60 @@ def test_cupy_gather_pooled_orders_conversion_and_launch_on_one_stream() -> None
         "empty",
         "launch",
     ]
+
+
+@pytest.mark.parametrize(
+    "feature_count,max_elements,dim",
+    [(12, 30, 128), (44, 30, 40), (2, 1, 418)],
+)
+def test_cupy_register_scatter_matches_duplicate_key_sum(
+    feature_count: int, max_elements: int, dim: int
+) -> None:
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+    except cupy.cuda.runtime.CUDARuntimeError:
+        pytest.skip("requires a CUDA device")
+    batch_size, rows = 48, 256
+    rng = np.random.default_rng(93)
+    inverse = rng.integers(
+        0, rows // 4, (batch_size, feature_count, max_elements), dtype=np.int32
+    )
+    inverse[rng.random(inverse.shape) < 0.8] = rows
+    gradient = rng.standard_normal((batch_size, feature_count, dim)).astype(np.float32)
+    flat_inverse = inverse.reshape(-1)
+    flat_gradient = np.repeat(gradient.reshape(-1, dim), max_elements, axis=0)
+    valid = flat_inverse != rows
+    expected = np.zeros((rows, dim), dtype=np.float32)
+    np.add.at(expected, flat_inverse[valid], flat_gradient[valid])
+
+    operator = CupySparseEmbeddingOperator("float16", "float32")
+    inverse_device = cupy.asarray(inverse)
+    gradient_device = cupy.asarray(gradient)
+    cupy.cuda.Stream.null.synchronize()
+    actual = operator.scatter_pooled(
+        rows,
+        dim,
+        inverse_device,
+        rows,
+        gradient_device,
+        (feature_count, max_elements),
+    )
+    operator.stream.synchronize()
+    np.testing.assert_allclose(cupy.asnumpy(actual), expected, atol=2e-4, rtol=2e-4)
+
+
+def test_cupy_pooled_scatter_rejects_partial_inverse_slots() -> None:
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+    except cupy.cuda.runtime.CUDARuntimeError:
+        pytest.skip("requires a CUDA device")
+    operator = CupySparseEmbeddingOperator("float16", "float32")
+    with pytest.raises(ValueError, match="inverse slots must match"):
+        operator.scatter_pooled(
+            2,
+            2,
+            cupy.asarray([0, 1, 2], dtype=cupy.int32),
+            2,
+            cupy.ones((1, 1, 2), dtype=cupy.float32),
+            (1, 2),
+        )

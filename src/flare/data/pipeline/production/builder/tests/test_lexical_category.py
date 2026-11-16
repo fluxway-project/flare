@@ -225,9 +225,7 @@ def test_native_parser_rejects_missing_and_undersized_category_outputs() -> None
     table = CategoryTable({7: {"10": 1}}, {7: 0})
     with pytest.raises(ValueError, match="category output is missing"):
         parse_arrow_direct(*args, FeatureBuffers({}), {}, table, -3, -3.0)
-    buffers = FeatureBuffers(
-        {"category_index_7": np.ones(1, dtype=np.uint8)}
-    )
+    buffers = FeatureBuffers({"category_index_7": np.ones(1, dtype=np.uint8)})
     buffers["category_index_7"] = np.empty(0, dtype=np.int32)
     with pytest.raises(ValueError, match="category scalar buffer is too small"):
         parse_arrow_direct(*args, buffers, {}, table, -3, -3.0)
@@ -292,7 +290,9 @@ def test_numeric_only_vector_keeps_its_sentinel_filtering() -> None:
 def test_present_invalid_numeric_token_raises(is_float: bool, value: str) -> None:
     dtype = pa.float32() if is_float else pa.int64()
     spec = ParserSpec(
-        features=(ParserFeatureSpec(code=7, name="numeric", length=1, is_float=is_float),),
+        features=(
+            ParserFeatureSpec(code=7, name="numeric", length=1, is_float=is_float),
+        ),
         feature_column_index={},
         raw_schema=pa.schema([pa.field("numeric", dtype)]),
         direct_column_index={},
@@ -308,7 +308,9 @@ def test_present_invalid_numeric_token_raises(is_float: bool, value: str) -> Non
 
 def test_category_token_without_required_numeric_value_raises() -> None:
     spec = ParserSpec(
-        features=(ParserFeatureSpec(code=7, name="category", length=1, is_float=False),),
+        features=(
+            ParserFeatureSpec(code=7, name="category", length=1, is_float=False),
+        ),
         feature_column_index={},
         raw_schema=pa.schema(
             [pa.field("category", pa.int64()), pa.field("category_index_7", pa.int32())]
@@ -329,16 +331,16 @@ def test_category_token_without_required_numeric_value_raises() -> None:
 def test_invalid_numeric_vector_token_raises() -> None:
     parser = _parser()
     with pytest.raises(ValueError, match="invalid numeric feature value"):
-        parser.parse_to_table(
-            pa.chunked_array([pa.array(["7" + chr(3) + "[10,abc]"])])
-        )
+        parser.parse_to_table(pa.chunked_array([pa.array(["7" + chr(3) + "[10,abc]"])]))
 
 
 def test_invalid_numeric_direct_value_raises() -> None:
     spec = ParserSpec(
         features=(ParserFeatureSpec(code=7, name="numeric", length=1, is_float=False),),
         feature_column_index={},
-        raw_schema=pa.schema([pa.field("numeric", pa.int64()), pa.field("id", pa.int64())]),
+        raw_schema=pa.schema(
+            [pa.field("numeric", pa.int64()), pa.field("id", pa.int64())]
+        ),
         direct_column_index={"id": 0},
         metadata_column_index={},
         feature_payload_column_index=1,

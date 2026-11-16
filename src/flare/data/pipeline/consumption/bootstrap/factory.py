@@ -69,9 +69,11 @@ def iceberg_catalog_kwargs(options: Mapping[str, Any]) -> dict[str, Any]:
         catalog_type=options.get("catalog_type"),
         uri=options.get("catalog_uri"),
         warehouse=options.get("warehouse"),
-        extra={"token": options["catalog_token"]}
-        if options.get("catalog_token") is not None
-        else None,
+        extra=(
+            {"token": options["catalog_token"]}
+            if options.get("catalog_token") is not None
+            else None
+        ),
     )
 
 
@@ -93,6 +95,7 @@ def _iceberg_source_configuration(
         "catalog_provider": provider,
         "projection": tuple(projection),
         "mode": mode,
+        "row_filter": options.get("iceberg_partition_range"),
     }
 
 
@@ -142,6 +145,7 @@ _STANDARD_OPTION_NAMES = frozenset(
         "catalog_kwargs",
         "iceberg_config",
         "iceberg_snapshot_id",
+        "iceberg_partition_range",
         "mode",
         "table_identifier",
         "iceberg_max_open_files",

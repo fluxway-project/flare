@@ -1,6 +1,7 @@
 import asyncio
 
 import numpy as np
+import pytest
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.resource_registry import ResourceRegistry, bind_resource_registry
 from fluxway.common.types.tensor import TransportTensor
@@ -43,6 +44,34 @@ def test_input_dynamic_routing_uses_registered_assignment_owner() -> None:
     strategy = output_sharding["unique_hashed_sparse_dim_4"].routing.strategy
     assert strategy.target.namespace == "sparse_embedding"
     assert strategy.target.resource_id == "hashed_sparse.assignment"
+
+
+def test_input_spmd_config_carries_bounded_rank_skew() -> None:
+    bound_input = get_input_spmd_class(
+        sparse_groups=("hashed_sparse_dim_4",),
+        runtime_env=None,
+        resource_profile=None,
+        batch_shardings={"samples_valid_count": {"type": "static", "axis": []}},
+        key_dtype="int64",
+        sparse_partition_assignment_spec=PartitionSpec.hash(),
+        max_rank_step_skew=1,
+    )
+
+    config = bound_input.get_spmd_config()
+    assert config.max_rank_step_skew == 1
+
+
+def test_input_spmd_rejects_negative_rank_skew() -> None:
+    with pytest.raises(ValueError, match="max_rank_step_skew"):
+        get_input_spmd_class(
+            sparse_groups=(),
+            runtime_env=None,
+            resource_profile=None,
+            batch_shardings={},
+            key_dtype="int64",
+            sparse_partition_assignment_spec=PartitionSpec.hash(),
+            max_rank_step_skew=-1,
+        )
 
 
 def test_input_cpu_deduplication_preserves_routing_contract() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import date
 from typing import Any
 
 from pyiceberg.avro.resolver import resolve_reader
@@ -19,6 +20,7 @@ from pyiceberg.manifest import (
     ManifestFile,
     _inherit_from_manifest,
 )
+from pyiceberg.transforms import IdentityTransform
 
 from flare.data.connectors.adapters.iceberg.avro_blocks import BoundedAvroBlocks
 from flare.data.connectors.adapters.iceberg.scan_cursor import (
@@ -51,8 +53,7 @@ class IcebergManifestTraversal:
         row_filter: Mapping[str, Any] | None,
     ) -> FileScanResult:
         del projection
-        if row_filter is not None:
-            raise ValueError("Iceberg manifest traversal does not support row filters")
+        partition_range = self._partition_range(row_filter)
         if snapshot_id != cursor.snapshot_id:
             raise ValueError("manifest traversal snapshot identity mismatch")
         for value in (max_records, max_units, max_metadata_block_bytes):
@@ -77,7 +78,12 @@ class IcebergManifestTraversal:
             )
         if cursor.state.manifest is None:
             return self._read_manifest_list(
-                io, cursor.state, format_version, max_metadata_block_bytes
+                io,
+                cursor.state,
+                format_version,
+                max_metadata_block_bytes,
+                table=table,
+                partition_range=partition_range,
             )
         return self._read_manifest(
             io,
@@ -86,6 +92,8 @@ class IcebergManifestTraversal:
             max_records,
             max_units,
             max_metadata_block_bytes,
+            table=table,
+            partition_range=partition_range,
         )
 
     def _read_manifest_list(
@@ -94,6 +102,9 @@ class IcebergManifestTraversal:
         state: TraversalState,
         format_version: int,
         block_limit: int,
+        *,
+        table: Any,
+        partition_range: tuple[str, str, str] | None,
     ) -> FileScanResult:
         input_file = io.new_input(state.manifest_list.path)
         if len(input_file) != state.manifest_list.object_length:
@@ -111,6 +122,10 @@ class IcebergManifestTraversal:
             )
             for row, manifest in enumerate(reader.iter_records(block, resolver)):
                 if row < state.manifest_list_offset.row_offset:
+                    continue
+                if partition_range is not None and not self._manifest_overlaps_range(
+                    table, manifest, partition_range
+                ):
                     continue
                 ref = self._manifest_ref(io, manifest)
                 if ref.content != str(ManifestContent.DATA.value):
@@ -140,6 +155,9 @@ class IcebergManifestTraversal:
         max_records: int,
         max_units: int,
         block_limit: int,
+        *,
+        table: Any,
+        partition_range: tuple[str, str, str] | None,
     ) -> FileScanResult:
         assert state.manifest is not None and state.manifest_entry_offset is not None
         input_file = io.new_input(state.manifest.path)
@@ -179,6 +197,7 @@ class IcebergManifestTraversal:
             files: list[FileScanRange] = []
             records = 0
             current = state
+            partition_index: int | None = None
             for row, entry in enumerate(reader.iter_records(block, resolver)):
                 if row < state.manifest_entry_offset.row_offset:
                     continue
@@ -196,6 +215,20 @@ class IcebergManifestTraversal:
                     continue
                 if entry.data_file.content is not DataFileContent.DATA:
                     raise ValueError("Iceberg manifest contains a non-data file")
+                if partition_range is not None:
+                    if partition_index is None:
+                        partition_index = self._partition_index(
+                            table, state.manifest.partition_spec_id, partition_range[0]
+                        )
+                    partition = entry.data_file.partition
+                    value = partition[partition_index]
+                    if not isinstance(value, str):
+                        raise ValueError(
+                            "Iceberg partition range value must be a string"
+                        )
+                    if not (partition_range[1] <= value <= partition_range[2]):
+                        current = after_entry
+                        continue
                 path, total_count, record_format = self._data_file_fact(entry.data_file)
                 record_start = current.file_record_offset
                 if record_start > total_count:
@@ -230,6 +263,75 @@ class IcebergManifestTraversal:
                 current,
                 snapshot_exhausted=False,
             )
+
+    @staticmethod
+    def _partition_range(
+        row_filter: Mapping[str, Any] | None,
+    ) -> tuple[str, str, str] | None:
+        if row_filter is None:
+            return None
+        if set(row_filter) != {"field", "gte", "lte"}:
+            raise ValueError("Iceberg row filters require an identity partition range")
+        field_name = row_filter["field"]
+        if not isinstance(field_name, str) or not field_name.strip():
+            raise ValueError("Iceberg partition range field must be nonempty")
+        start, end = row_filter["gte"], row_filter["lte"]
+        try:
+            canonical = all(
+                isinstance(value, str)
+                and len(value) == 10
+                and date.fromisoformat(value).isoformat() == value
+                for value in (start, end)
+            )
+        except ValueError:
+            canonical = False
+        if not canonical or start > end:
+            raise ValueError("Iceberg partition range requires ordered ISO dates")
+        return field_name, start, end
+
+    @staticmethod
+    def _partition_index(table: Any, spec_id: int, field_name: str) -> int:
+        spec = table.specs().get(spec_id)
+        if spec is None:
+            raise ValueError(f"Iceberg partition spec does not exist: {spec_id}")
+        matches = [
+            index
+            for index, field in enumerate(spec.fields)
+            if field.name == field_name
+            and isinstance(field.transform, IdentityTransform)
+        ]
+        if len(matches) != 1:
+            raise ValueError("Iceberg range filtering requires an identity partition")
+        return matches[0]
+
+    @classmethod
+    def _manifest_overlaps_range(
+        cls, table: Any, manifest: ManifestFile, partition_range: tuple[str, str, str]
+    ) -> bool:
+        try:
+            index = cls._partition_index(
+                table, manifest.partition_spec_id, partition_range[0]
+            )
+        except ValueError:
+            return True  # Inspect entries when the manifest cannot be pruned.
+        summaries = manifest.partitions
+        if summaries is None or index >= len(summaries):
+            return True
+        summary = summaries[index]
+        if hasattr(summary, "lower_bound"):
+            lower, upper = summary.lower_bound, summary.upper_bound
+        else:
+            lower, upper = summary[2], summary[3]
+        if lower is None or upper is None:
+            return True
+        try:
+            minimum, maximum = (
+                bytes(lower).decode("utf-8"),
+                bytes(upper).decode("utf-8"),
+            )
+        except UnicodeError:
+            return True
+        return maximum >= partition_range[1] and minimum <= partition_range[2]
 
     @staticmethod
     def _result(

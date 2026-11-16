@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -183,7 +184,6 @@ class RecsysBackboneTrainSPMD:
         if validate_tensor_values:
             self.validate_tensor_values = True
         self.micro_step = 0
-        self._prepared_execution_for_next_batch = False
         if execution_tracer is not None and execution_tracer.include_values:
             self._last_module_before: Mapping[str, Any] | None = None
         if self.execution_plan.accumulation.micro_steps != self.grad_accum_steps:
@@ -193,7 +193,8 @@ class RecsysBackboneTrainSPMD:
         self._last_result: TrainStepResult | None = None
         self._last_update_window: OptimizerUpdateWindow | None = None
         self._last_update_window_payload: np.ndarray | None = None
-        self._pending_jax_leases: list[tuple[Any, ...]] = []
+        self._pending_jax_leases: dict[int, tuple[Any, ...]] = {}
+        self._pending_jax_leases_lock = threading.Lock()
         self._forward_fn = forward_fn
         self._loss_fn = loss_fn
         if (
@@ -282,7 +283,22 @@ class RecsysBackboneTrainSPMD:
             validate_tensor_values=getattr(self, "validate_tensor_values", False),
         )
 
+    def _register_jax_leases(self, step: int, leases: tuple[Any, ...]) -> None:
+        with self._pending_jax_leases_lock:
+            if step in self._pending_jax_leases:
+                raise RuntimeError(
+                    f"prepare_jax_bind registered duplicate leases for step={step}"
+                )
+            self._pending_jax_leases[step] = leases
+
+    def _take_jax_leases(self, step: int) -> tuple[Any, ...] | None:
+        with self._pending_jax_leases_lock:
+            return self._pending_jax_leases.pop(step, None)
+
     def prepare_jax_bind(self, **kwargs: Any) -> dict[str, Any]:
+        operator_step = require_operator_step(
+            self, "RecsysBackboneTrain.prepare_jax_bind"
+        )
         result: dict[str, Any] = {}
         leases = []
 
@@ -326,8 +342,7 @@ class RecsysBackboneTrainSPMD:
             self._record_execution_phase(
                 "operator_prepare_end", payload={"phase": "compile"}
             )
-            self._prepared_execution_for_next_batch = True
-            self._pending_jax_leases.append(tuple(leases))
+            self._register_jax_leases(operator_step, tuple(leases))
             return result
         except BaseException:
             release_jax_leases(leases)
@@ -371,30 +386,43 @@ class RecsysBackboneTrainSPMD:
         return self._engine
 
     def train_core(self, **kwargs: Any) -> dict[str, Any]:
-        leases = self._pending_jax_leases.pop(0)
+        operator_step = require_operator_step(self, "RecsysBackboneTrain.train_core")
+        leases = self._take_jax_leases(operator_step)
+        direct_bind = leases is None
+        if leases is None:
+            leases = []
+
+        def bind_for_core(value: Any) -> Any:
+            if direct_bind:
+                array, lease = to_jax_array_with_lease(value)
+                if lease is not None:
+                    leases.append(lease)
+                return array
+            return to_jax_array(value)
+
         try:
             inputs = {
-                group: to_jax_array(kwargs[f"jax_input_{group}"])
+                group: bind_for_core(kwargs[f"jax_input_{group}"])
                 for group in (*self.sparse_groups, *self.side_info_groups)
             }
-            labels = to_jax_array(kwargs["jax_labels"])
-            samples_valid_count = to_jax_array(kwargs["jax_samples_valid_count"])
+            labels = bind_for_core(kwargs["jax_labels"])
+            samples_valid_count = bind_for_core(kwargs["jax_samples_valid_count"])
             targets = {
                 "labels": labels,
                 "samples_valid_count": samples_valid_count,
                 "global_row_start": self.rank * labels.shape[0],
                 "world_size": self.world_size,
             }
-            preparation_already_recorded = self._prepared_execution_for_next_batch
-            if not preparation_already_recorded:
-                self._record_execution_phase(
-                    "operator_prepare_begin", payload={"phase": "compile"}
-                )
-                self._executor.prepare_execution(inputs, targets)
-                self._record_execution_phase(
-                    "operator_prepare_end", payload={"phase": "compile"}
-                )
-            self._prepared_execution_for_next_batch = False
+            # Idempotent and single-flight in DistributedNnxTrainEngine. Keep
+            # this call so direct train_core invocations that bypass
+            # prepare_jax_bind still have a valid compiled execution path.
+            self._record_execution_phase(
+                "operator_prepare_begin", payload={"phase": "compile"}
+            )
+            self._executor.prepare_execution(inputs, targets)
+            self._record_execution_phase(
+                "operator_prepare_end", payload={"phase": "compile"}
+            )
             if getattr(self, "_trace_values", False):
                 self._last_module_before = self._executor.capture_module_fingerprint()
             self._record_execution_phase(
@@ -447,7 +475,9 @@ class RecsysBackboneTrainSPMD:
             output[f"grad_jax_{group}"] = gradient
         return output
 
-    def scatter_sparse_grads(self, **kwargs: Any) -> dict[str, Any]:
+    def scatter_sparse_grads(
+        self, optimizer_update_window: Any, **kwargs: Any
+    ) -> dict[str, Any]:
         operator_step = require_operator_step(
             self, "RecsysBackboneTrain.scatter_sparse_grads"
         )
@@ -498,7 +528,13 @@ class RecsysBackboneTrainSPMD:
                 pending.append((group, grad, inverse_value, emb_ref))
             if stream is not None:
                 stream.synchronize()
-        result: dict[str, Any] = {}
+        # Forward the invocation's window, never the mutable _last_result:
+        # scatter may run after a later train_core has already completed.
+        result: dict[str, Any] = {
+            "optimizer_update_window": np.asarray(
+                transport_payload(optimizer_update_window), dtype=np.int64
+            ).copy(),
+        }
         for group, grad, inverse_value, emb_ref in pending:
             result[f"grad_{group}"] = make_transport_tensor(
                 grad, source_step=operator_step

@@ -5,8 +5,8 @@ import json
 import pyarrow as pa
 import pytest
 
-from flare.data.pipeline.production.builder.encoding.protocol import MASK_48
 from flare.data.pipeline.production.builder.encoding.dense import CategoryLookupTable
+from flare.data.pipeline.production.builder.encoding.protocol import MASK_48
 from flare.data.pipeline.production.builder.expr_plan import ExprPlan
 from flare.data.pipeline.production.builder.feature_processor import FeatureProcessor
 from flare.data.schema.feature_catalog import FeatureOutputKind
@@ -44,7 +44,9 @@ def write_config(tmp_path, *, as_it_is: list[str]) -> tuple[str, str, str]:
 
 
 def test_category_lookup_requires_exact_lexeme_strings() -> None:
-    with pytest.raises(TypeError, match="category vocabulary keys must be non-empty strings"):
+    with pytest.raises(
+        TypeError, match="category vocabulary keys must be non-empty strings"
+    ):
         CategoryLookupTable.from_mapping({0.5: 3})
 
 

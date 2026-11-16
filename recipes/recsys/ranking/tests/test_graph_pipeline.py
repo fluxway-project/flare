@@ -218,6 +218,48 @@ def assert_native_graph_assembly(tmp_path, mode, label, group, config_factory):
                 metrics_spmd_name="Metrics",
             )
     compiled = result["task_graph"].require_compiled_graph()
+    if mode == "train":
+        # All remote sparse-update traffic, including the window token, must
+        # originate at scatter. It must not consume train_core's send credits.
+        update_edges = [
+            edge.spec
+            for edge in compiled.dependencies
+            if edge.spec.target.spmd_id.startswith("Embedding_")
+            and edge.spec.target.op_id == "update"
+        ]
+        assert update_edges
+        assert all(edge.source.op_id == "scatter_sparse_grads" for edge in update_edges)
+        dense_update_edges = [
+            edge.spec
+            for edge in compiled.dependencies
+            if edge.spec.source.op_id == "train_core"
+            and edge.spec.target.op_id == "update"
+        ]
+        assert len(dense_update_edges) == 1
+        assert dense_update_edges[0].condition is not None
+        prepare_bind = [
+            edge.spec
+            for edge in compiled.dependencies
+            if edge.spec.source.op_id == "prepare_sparse_materialize"
+            and edge.spec.target.op_id == "prepare_jax_bind"
+        ]
+        assert prepare_bind
+        assert all(
+            transfer.target.name != "padded_inverse_entity_dim_2"
+            for edge in prepare_bind
+            for transfer in edge.transfers
+        )
+        prepare_scatter = [
+            edge.spec
+            for edge in compiled.dependencies
+            if edge.spec.source.op_id == "prepare_sparse_materialize"
+            and edge.spec.target.op_id == "scatter_sparse_grads"
+        ]
+        assert any(
+            transfer.target.name == "padded_inverse_entity_dim_2"
+            for edge in prepare_scatter
+            for transfer in edge.transfers
+        )
     assert (
         compiled.spmd("Reader").operator("read").execution_layout.logical_mesh.size == 1
     )
@@ -238,3 +280,108 @@ def test_native_graph_assembly_uses_injected_task_and_source(
     tmp_path, mode, label, group
 ):
     assert_native_graph_assembly(tmp_path, mode, label, group, SimpleNamespace)
+
+
+def test_training_phase_gates_match_ranking_causal_schedule():
+    from fluxway.common.schedule_semantics import compile_phase_schedule
+
+    from recipes.recsys.ranking.workers.schedule import (
+        RANKING_PHASE_LANES,
+        ranking_phase_schedule,
+    )
+
+    policies = {phase: ranking_phase_schedule(phase) for phase in RANKING_PHASE_LANES}
+    gates = compile_phase_schedule(policies).gates
+    assert gates["prepare_jax_bind"].predecessors == (
+        ("prepare_sparse_materialize", 0),
+    )
+    assert gates["train_core"].predecessors == (
+        ("prepare_jax_bind", 0),
+        ("update", 1),
+    )
+    assert gates["scatter_sparse_grads"].predecessors == (("train_core", 0),)
+
+
+def test_dense_update_condition_skips_non_boundary_windows():
+    from types import SimpleNamespace
+
+    import numpy as np
+    from fluxway.spmd.worker.operator_manager.dispatcher import (
+        ExecutionResult,
+        ExecutionStatus,
+    )
+
+    from flare.training.execution import OptimizerUpdateWindow
+    from recipes.recsys.ranking.topology import _should_apply_dense_update
+
+    non_boundary = OptimizerUpdateWindow(
+        micro_step=1,
+        accumulation_steps=3,
+        at_boundary=False,
+        should_apply_update=False,
+        optimizer_step=0,
+    )
+    boundary = OptimizerUpdateWindow(
+        micro_step=3,
+        accumulation_steps=3,
+        at_boundary=True,
+        should_apply_update=True,
+        optimizer_step=0,
+    )
+
+    assert not _should_apply_dense_update(
+        ExecutionResult(
+            status=ExecutionStatus.SUCCESS,
+            data={"optimizer_update_window": np.asarray(non_boundary.encode())},
+        )
+    )
+    assert _should_apply_dense_update(
+        SimpleNamespace(data={"optimizer_update_window": np.asarray(boundary.encode())})
+    )
+
+
+def test_sparse_owner_cpu_override_reaches_bound_table(tmp_path, monkeypatch):
+    from recipes.recsys.ranking.graph import pipeline
+
+    original = pipeline.get_sparse_table_class
+    observed = []
+
+    def capture(*args, **kwargs):
+        observed.append(args[3].base["CPU"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "get_sparse_table_class", capture)
+    assert_native_graph_assembly(
+        tmp_path,
+        "train",
+        "outcome",
+        "visitor",
+        lambda **kwargs: SimpleNamespace(**kwargs, sparse_table_cpus="entity:2"),
+    )
+    assert observed and all(value == 2 for value in observed)
+
+
+def test_sparse_owner_thread_budget_is_independent_of_ray_cpus(tmp_path, monkeypatch):
+    from recipes.recsys.ranking.graph import pipeline
+
+    original = pipeline.get_sparse_table_class
+    observed = []
+
+    def capture(*args, **kwargs):
+        bound = original(*args, **kwargs)
+        observed.append((args[3].base["CPU"], bound._factory_thread_budget))
+        return bound
+
+    monkeypatch.setattr(pipeline, "get_sparse_table_class", capture)
+    assert_native_graph_assembly(
+        tmp_path,
+        "train",
+        "outcome",
+        "visitor",
+        lambda **kwargs: SimpleNamespace(
+            **kwargs,
+            sparse_table_cpus="entity:2",
+            sparse_table_threads="entity:64",
+        ),
+    )
+    assert observed and all(cpu == 2 and threads == 64 for cpu, threads in observed)

@@ -53,8 +53,18 @@ def test_cupy_scatter_finishes_before_bf16_gradient_is_routed(
         inputs[f"emb_ref_{group}"] = make_transport_tensor(
             cupy.zeros((rows, width), dtype=cupy.float16)
         )
+    # The test creates producers on the default stream and consumes them on
+    # the operator's nonblocking stream; establish that handoff explicitly.
+    cupy.cuda.Stream.null.synchronize()
+    window = np.asarray([1, 3, 0, 0, 17], dtype=np.int64)
+    # A later core result must not change the window attached to these grads.
+    worker._last_update_window_payload = np.asarray([3, 3, 1, 1, 18], dtype=np.int64)
     for _ in range(10):
-        result = worker.scatter_sparse_grads(**inputs)
+        result = worker.scatter_sparse_grads(
+            optimizer_update_window=make_transport_tensor(window), **inputs
+        )
+        np.testing.assert_array_equal(result["optimizer_update_window"], window)
+        assert not np.shares_memory(result["optimizer_update_window"], window)
         for index, group in enumerate(groups):
             gradient = result[f"grad_{group}"].flat_values
             expected = np.broadcast_to(

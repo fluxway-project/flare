@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from types import SimpleNamespace
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -12,6 +13,7 @@ from sparse_embedding.checkpoint.lance_backend import _LanceCheckpointStorage
 
 from flare.jax.training.engines.contracts import TrainStepResult
 from flare.runtime.fluxway.transport import make_transport_tensor
+from flare.runtime.fluxway.workers.dynamic_embedding import sparse_update_async_policy
 from flare.runtime.sparse_precision import prepare_sparse_native_gradient
 from flare.training.components.steppers import GenericLossAdapter
 from flare.training.execution import (
@@ -38,6 +40,7 @@ from recipes.recsys.ranking.schema.sparse_features import (
     extract_sparse_base_names,
     extract_sparse_groups_and_dimensions,
     parse_sparse_group_name,
+    parse_sparse_thread_budgets,
     parse_sparse_workers,
 )
 from recipes.recsys.ranking.workers.schedule import (
@@ -161,8 +164,11 @@ def test_metrics_requires_delivered_optimizer_update_window():
 
 def test_train_core_preserves_engine_normalized_sparse_gradients() -> None:
     class _Executor:
+        def __init__(self):
+            self.prepared = []
+
         def prepare_execution(self, inputs, targets):
-            del inputs, targets
+            self.prepared.append((inputs, targets))
 
         def micro_step(self, inputs, targets):
             del inputs, targets
@@ -188,7 +194,9 @@ def test_train_core_preserves_engine_normalized_sparse_gradients() -> None:
             )
 
     worker = object.__new__(RecsysBackboneTrainSPMD)
-    worker._pending_jax_leases = [()]
+    worker.ctx = SimpleNamespace(step=0)
+    worker._pending_jax_leases = {}
+    worker._pending_jax_leases_lock = threading.Lock()
     worker.sparse_groups = ("group1_dim_16",)
     worker.side_info_groups = ()
     worker.rank = 0
@@ -198,7 +206,6 @@ def test_train_core_preserves_engine_normalized_sparse_gradients() -> None:
     worker._last_result = None
     worker._last_update_window = None
     worker._last_update_window_payload = None
-    worker._prepared_execution_for_next_batch = False
     worker.micro_step = 0
     worker.grad_accum_steps = 3
     worker.sparse_gradient_dtype = "float32"
@@ -211,9 +218,23 @@ def test_train_core_preserves_engine_normalized_sparse_gradients() -> None:
     )
 
     assert output["grad_jax_group1_dim_16"].dtype == np.dtype("bfloat16")
+    assert len(worker._executor.prepared) == 1
     np.testing.assert_allclose(
         np.asarray(output["grad_jax_group1_dim_16"], dtype=np.float32), 12.0
     )
+
+
+def test_jax_leases_are_taken_by_step_not_completion_order():
+    worker = object.__new__(RecsysBackboneTrainSPMD)
+    worker._pending_jax_leases = {}
+    worker._pending_jax_leases_lock = threading.Lock()
+
+    worker._register_jax_leases(3, ("lease-3",))
+    worker._register_jax_leases(2, ("lease-2",))
+
+    assert worker._take_jax_leases(2) == ("lease-2",)
+    assert worker._take_jax_leases(3) == ("lease-3",)
+    assert worker._take_jax_leases(2) is None
 
 
 @pytest.mark.parametrize("wire_dtype", ["float32", "bfloat16"])
@@ -255,6 +276,9 @@ def test_scatter_sparse_gradients_quantizes_only_after_fp32_sum(
     if wire_dtype == "bfloat16":
         gradient_input = gradient_input.astype(np.dtype("bfloat16"))
     result = worker.scatter_sparse_grads(
+        optimizer_update_window=make_transport_tensor(
+            np.asarray([1, 3, 0, 0, 0], dtype=np.int64)
+        ),
         grad_jax_group=make_transport_tensor(gradient_input),
         padded_inverse_group=make_transport_tensor(np.asarray([0, 0], dtype=np.int32)),
         emb_ref_group=make_transport_tensor(np.zeros((2, 1), dtype=np.float16)),
@@ -433,3 +457,25 @@ def test_parse_sparse_workers_contracts() -> None:
         parse_sparse_workers("t1:2,t1:4", groups)
     with pytest.raises(ValueError, match="must be positive"):
         parse_sparse_workers("t1:0", groups)
+
+
+def test_parse_sparse_thread_budgets_allow_oversubscription() -> None:
+    groups = ("t1_dim_10", "t2_dim_20", "t1_dim_30")
+    assert parse_sparse_thread_budgets("", groups) == {}
+    assert parse_sparse_thread_budgets("64", groups) == {"t1": 64, "t2": 64}
+    assert parse_sparse_thread_budgets("t1:128", groups) == {"t1": 128}
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        parse_sparse_thread_budgets("t1:many", groups)
+    with pytest.raises(ValueError, match="must be positive"):
+        parse_sparse_thread_budgets("t1:0", groups)
+    with pytest.raises(ValueError, match="unknown sparse group"):
+        parse_sparse_thread_budgets("other:64", groups)
+    with pytest.raises(ValueError, match="duplicate sparse group"):
+        parse_sparse_thread_budgets("t1:64,t1:128", groups)
+
+
+def test_sparse_update_keeps_owner_execution_serial() -> None:
+    policy = sparse_update_async_policy().compile()
+    assert policy.pipeline_depth == 1
+    assert policy.max_inflight_steps == 0

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from types import MethodType
 from typing import Any
 
 import jax
 import pytest
 
-from flare.jax.training.engines.distributed import initialize_distributed_jax
+from flare.jax.training.engines.distributed import (
+    DistributedNnxTrainEngine,
+    initialize_distributed_jax,
+)
 from flare.training.execution import (
     DistributedTrainStepExecutor,
     GradientAccumulationPolicy,
@@ -95,6 +102,41 @@ def test_distributed_executor_exposes_side_effect_free_preparation_seam() -> Non
     executor.prepare_execution(inputs, targets)
 
     assert prepared == [(inputs, targets)]
+
+
+def test_distributed_jax_prepare_is_single_flight_for_same_signature() -> None:
+    engine = object.__new__(DistributedNnxTrainEngine)
+    engine._prepare_execution_lock = threading.RLock()
+    engine._prepared_execution_signature = None
+    signature = ("same-key-order", ((2, 3),), ((2,),))
+    compile_entries = 0
+    compile_entries_lock = threading.Lock()
+
+    def fake_prepare_locked(self, inputs, targets):
+        del inputs, targets
+        if self._prepared_execution_signature == signature:
+            return
+        nonlocal compile_entries
+        with compile_entries_lock:
+            compile_entries += 1
+        # Model the window occupied by lower(...).compile().
+        time.sleep(0.03)
+        self._prepared_execution_signature = signature
+
+    engine._prepare_execution_locked = MethodType(fake_prepare_locked, engine)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(
+                engine.prepare_execution,
+                {"batch": object()},
+                {"labels": object()},
+            )
+            for _ in range(4)
+        ]
+        for future in futures:
+            future.result()
+
+    assert compile_entries == 1
 
 
 def test_operator_phase_events_include_monotonic_sequence() -> None:

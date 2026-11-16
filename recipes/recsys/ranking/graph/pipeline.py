@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 from fluxway.common.types.checkpoint import CheckpointRetentionPolicy
@@ -28,6 +29,7 @@ from flare.runtime.sparse_precision import require_key_dtype
 from recipes.recsys.ranking.resources import resolve_ranking_resource_profiles
 from recipes.recsys.ranking.schema.sparse_features import (
     extract_sparse_groups_and_dimensions,
+    parse_sparse_thread_budgets,
     parse_sparse_workers,
 )
 from recipes.recsys.ranking.task import RankingTask
@@ -102,6 +104,15 @@ def build_pipeline_nodes(
     )
     data_types = build_ranking_fluxway_data_types(sparse_groups)
     sparse_workers_config = parse_sparse_workers(args.sparse_workers, sparse_groups)
+    sparse_table_cpus_arg = getattr(args, "sparse_table_cpus", "")
+    sparse_table_cpus = (
+        parse_sparse_workers(sparse_table_cpus_arg, sparse_groups)
+        if sparse_table_cpus_arg
+        else {}
+    )
+    sparse_thread_budgets = parse_sparse_thread_budgets(
+        getattr(args, "sparse_table_threads", ""), sparse_groups
+    )
     if resource_profiles is not None:
         resources = resource_profiles
     else:
@@ -191,14 +202,25 @@ def build_pipeline_nodes(
         key_dtype=key_dtype,
         sparse_partition_assignment_spec=sparse_partition_assignment_spec,
         pipeline_depth=local_pipeline_depth,
+        max_rank_step_skew=getattr(args, "input_max_rank_step_skew", 1),
     )
 
     def sparse_table_factory(name: str, dims: list[int], shards: int) -> type:
+        table_profile = resources.get_role("table")
+        if name in sparse_table_cpus:
+            table_profile = table_profile.model_copy(
+                update={
+                    "base": {
+                        **table_profile.base,
+                        "CPU": Decimal(sparse_table_cpus[name]),
+                    }
+                }
+            )
         return get_sparse_table_class(
             name,
             dims,
             shards,
-            resources.get_role("table"),
+            table_profile,
             runtime_env,
             args.sparse_ckpt_backend,
             args.sparse_max_staleness_steps,
@@ -210,6 +232,7 @@ def build_pipeline_nodes(
             gradient_transport_dtype=args.precision.sparse_gradient_transport_dtype_name,
             optimizer_dtype=args.precision.sparse_optimizer_dtype_name,
             key_dtype=key_dtype,
+            thread_budget=sparse_thread_budgets.get(name),
         )
 
     return PipelineNodes(
@@ -243,6 +266,7 @@ def build_pipeline_inputs(
     num_epochs: int = 10,
     cached_batch_metric_contract: Mapping[str, Any] | None = None,
     ranking_task: RankingTask,
+    partition_date_field: str | None = None,
     pretrained_weight_source: Any | None = None,
 ) -> PipelineInputs:
     if not isinstance(ranking_task, RankingTask):
@@ -296,6 +320,16 @@ def build_pipeline_inputs(
         raise TypeError("batch_transformer_factory must return a callable transformer")
     if common.source_descriptor is None:
         raise ValueError("ranking reader requires an assigned source descriptor")
+    partition_start = getattr(args, "iceberg_partition_start_date", None)
+    partition_end = getattr(args, "iceberg_partition_end_date", None)
+    if (partition_start is None) != (partition_end is None):
+        raise ValueError(
+            "Iceberg partition date filtering requires both start and end dates"
+        )
+    if partition_start is not None and not partition_date_field:
+        raise ValueError(
+            "partition_date_field is required for Iceberg partition date filtering"
+        )
     source = build_reader_source(
         descriptor=common.source_descriptor,
         projection=feature_layout.projection,
@@ -314,6 +348,15 @@ def build_pipeline_inputs(
             "warehouse": args.warehouse,
             "iceberg_config": args.iceberg_config,
             "iceberg_snapshot_id": args.iceberg_snapshot_id,
+            "iceberg_partition_range": (
+                {
+                    "field": partition_date_field,
+                    "gte": partition_start,
+                    "lte": partition_end,
+                }
+                if partition_start is not None
+                else None
+            ),
             "catalog_token": catalog_token,
             "table_identifier": args.table_identifier,
             "iceberg_max_open_files": args.iceberg_max_open_files,
@@ -368,6 +411,21 @@ def build_pipeline_inputs(
                 "optimizer_dtype": args.precision.sparse_optimizer_dtype_name,
                 "grad_accum_steps": args.grad_accum_steps,
                 "sparse_reserve_capacity": args.sparse_reserve_capacity,
+                "sparse_storage_memory_limit_bytes": getattr(
+                    args, "sparse_storage_memory_limit_bytes", None
+                ),
+                "sparse_storage_spill_dir": getattr(
+                    args, "sparse_storage_spill_dir", None
+                ),
+                "sparse_storage_max_spill_bytes": getattr(
+                    args, "sparse_storage_max_spill_bytes", None
+                ),
+                "sparse_storage_max_pages": getattr(
+                    args, "sparse_storage_max_pages", 0
+                ),
+                "sparse_storage_entries_per_page": getattr(
+                    args, "sparse_storage_entries_per_page", 0
+                ),
                 "weight_source": pretrained_weight_source,
                 "sparse_restore_payload": (
                     sparse_restore_payload.get(base_name)

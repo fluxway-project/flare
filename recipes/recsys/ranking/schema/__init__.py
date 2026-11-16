@@ -16,6 +16,7 @@ from recipes.recsys.ranking.schema.sparse_features import (
     extract_sparse_base_names,
     extract_sparse_groups_and_dimensions,
     parse_sparse_group_name,
+    parse_sparse_thread_budgets,
     parse_sparse_workers,
 )
 from recipes.recsys.ranking.schema.transform import (
@@ -32,6 +33,7 @@ __all__ = [
     "materialize_padded_inverse",
     "materialize_recsys_sparse_inputs",
     "parse_sparse_group_name",
+    "parse_sparse_thread_budgets",
     "parse_sparse_workers",
     "validate_inverse_range",
 ]

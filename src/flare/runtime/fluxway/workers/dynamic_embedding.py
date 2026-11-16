@@ -31,6 +31,7 @@ from flare.runtime.sparse_precision import (
 )
 from flare.training.components.sparse_table.contracts import SparseOptimizerConfig
 from flare.training.execution import OptimizerUpdateWindow
+from fluxway import profiler
 from fluxway.common.bind import bind_spmd
 from fluxway.common.decorators import requires_worker_process
 from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy, StatePolicy
@@ -136,6 +137,7 @@ class DynamicSparseEmbeddingSPMD:
     _factory_gradient_dtype: str | None = None
     _factory_gradient_transport_dtype: str | None = None
     _factory_optimizer_dtype: str | None = None
+    _factory_thread_budget: int | None = None
     _factory_assignment_spec: PartitionSpec | None = None
     _factory_resource_id: str | None = None
     rank: int
@@ -225,11 +227,13 @@ class DynamicSparseEmbeddingSPMD:
                 f"spec={self.key_dtype!r}"
             )
 
-        import ray
+        thread_budget = type(self)._factory_thread_budget
+        if thread_budget is None:
+            import ray
 
-        assigned_cpus = assigned_worker_cpu_count(
-            ray.get_runtime_context(), role_name="SparseTable worker"
-        )
+            thread_budget = assigned_worker_cpu_count(
+                ray.get_runtime_context(), role_name="SparseTable worker"
+            )
 
         optimizer_enabled = spec.get("optimizer_enabled")
         if not isinstance(optimizer_enabled, bool):
@@ -242,14 +246,16 @@ class DynamicSparseEmbeddingSPMD:
                 f"[SparseTable.__init__:{self.gname}] sparse_optimizer must be omitted "
                 "when optimizer_enabled=False"
             )
+        from flare.runtime.sparse_storage import sparse_storage_options
+
         embedding_config = se.EmbeddingConfig(
             dims=self.embed_dims,
-            thread_budget=assigned_cpus,
+            thread_budget=thread_budget,
             value_dtype=self.value_dtype,
             gradient_dtype=self.gradient_dtype,
             optimizer_dtype=self.optimizer_dtype,
             key_dtype=self.key_dtype,
-            storage=se.AutoStorage(),
+            **sparse_storage_options(spec, group=self.gname),
             enable_optimizer=optimizer_enabled,
         )
         store_kwargs: dict[str, Any] = {
@@ -496,7 +502,7 @@ class DynamicSparseEmbeddingSPMD:
                             gradients_by_key[key_value] += gradient
                         else:
                             gradients_by_key[key_value] = gradient.copy()
-        for grad_list in grads_by_dim.values():
+        for dim, grad_list in grads_by_dim.items():
             for keys, tensor in grad_list:
                 if keys.size > 0:
                     native_gradient = prepare_sparse_native_gradient(
@@ -509,7 +515,16 @@ class DynamicSparseEmbeddingSPMD:
                     # The native store accumulates keyed sums. Replica or
                     # token normalization belongs to an explicit upstream
                     # contract; this path must not infer it from key counts.
-                    await self.store.async_accumulate_gradients(keys, grad_data)
+                    if profiler.enabled():
+                        async with profiler.async_scope(
+                            "sparse.accumulate_gradients",
+                            group=self.gname,
+                            dim=int(dim),
+                            key_count=int(keys.size),
+                        ):
+                            await self.store.async_accumulate_gradients(keys, grad_data)
+                    else:
+                        await self.store.async_accumulate_gradients(keys, grad_data)
 
     async def _commit_optimizer_step(self, step: int, normalization_steps: int) -> None:
         if (
@@ -520,7 +535,15 @@ class DynamicSparseEmbeddingSPMD:
             raise ValueError("normalization_steps must be a positive integer")
         # This is the actual number of microsteps in this committed window,
         # including a 1/2-step tail. It is neither DP world size nor ID count.
-        await self.store.async_optimizer_step(normalization_steps)
+        if profiler.enabled():
+            async with profiler.async_scope(
+                "sparse.optimizer_step",
+                group=self.gname,
+                micro_steps=normalization_steps,
+            ):
+                await self.store.async_optimizer_step(normalization_steps)
+        else:
+            await self.store.async_optimizer_step(normalization_steps)
         self._last_committed_step = step
         self._steps_since_commit = 0
         self._committed_steps += 1
@@ -710,6 +733,7 @@ def get_sparse_embedding_class(
     gradient_dtype: str,
     gradient_transport_dtype: str,
     optimizer_dtype: str,
+    thread_budget: int | None = None,
 ) -> type:
     if not isinstance(optimizer_enabled, bool):
         raise TypeError("optimizer_enabled must be bool")
@@ -724,6 +748,10 @@ def get_sparse_embedding_class(
         gradient_transport_dtype
     )
     optimizer_dtype = require_sparse_optimizer_dtype(optimizer_dtype)
+    if thread_budget is not None and (
+        type(thread_budget) is not int or thread_budget <= 0
+    ):
+        raise ValueError("sparse thread_budget must be a positive integer")
     if not optimizer_enabled and load_optimizer_state:
         raise ValueError("load_optimizer_state=True requires optimizer_enabled=True")
     if not optimizer_enabled and ckpt_backend is not None:
@@ -763,23 +791,25 @@ def get_sparse_embedding_class(
         "mesh_axis_shapes": (shards,),
         "runtime_env": runtime_env,
         "checkpoint_components": (
-            checkpoint_finalizer_registration(
-                f"{gname}_embedding_finalize",
-                lambda owner, context: owner.finalize_checkpoint_state(context),
-            ),
-            sparse_checkpoint_registration(
-                component_id=f"{gname}_embedding",
-                lineage_name=f"{gname}.embedding",
-                output_path=f"sparse/{gname}",
-                backend=ckpt_backend,
-                load_optimizer_state=load_optimizer_state,
-                mode=CheckpointSaveMode.INCREMENTAL,
-                initial_mode=CheckpointSaveMode.FULL,
-                include_page_images=False,
-            ),
-        )
-        if ckpt_backend is not None
-        else (),
+            (
+                checkpoint_finalizer_registration(
+                    f"{gname}_embedding_finalize",
+                    lambda owner, context: owner.finalize_checkpoint_state(context),
+                ),
+                sparse_checkpoint_registration(
+                    component_id=f"{gname}_embedding",
+                    lineage_name=f"{gname}.embedding",
+                    output_path=f"sparse/{gname}",
+                    backend=ckpt_backend,
+                    load_optimizer_state=load_optimizer_state,
+                    mode=CheckpointSaveMode.INCREMENTAL,
+                    initial_mode=CheckpointSaveMode.FULL,
+                    include_page_images=False,
+                ),
+            )
+            if ckpt_backend is not None
+            else ()
+        ),
         "lookup": {
             "async_policy": lookup_async_policy,
             "data_argument": [f"unique_ids_dim{d}" for d in dims],
@@ -805,6 +835,7 @@ def get_sparse_embedding_class(
     BoundTable._factory_gradient_dtype = gradient_dtype
     BoundTable._factory_gradient_transport_dtype = gradient_transport_dtype
     BoundTable._factory_optimizer_dtype = optimizer_dtype
+    BoundTable._factory_thread_budget = thread_budget
     BoundTable._factory_assignment_spec = sparse_partition_assignment_spec
     BoundTable._factory_resource_id = f"{gname}.assignment"
     BoundTable._factory_resource_info = {"resource_id": f"{gname}.assignment"}

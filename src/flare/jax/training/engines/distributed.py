@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -354,6 +355,10 @@ class DistributedNnxTrainEngine:
         self.step = 0
         self.micro_step = 0
         self._prepared_execution_signature: tuple[Any, ...] | None = None
+        # Multiple pipelined prepare_jax_bind invocations can reach this shared
+        # engine concurrently. Serialize the signature check and first compile
+        # so all callers share one in-flight preparation.
+        self._prepare_execution_lock = threading.RLock()
         if self.state_lifecycle is TrainingStateLifecycle.FRESH_INITIALIZE:
             if model_state is not None:
                 raise ValueError(
@@ -934,6 +939,13 @@ class DistributedNnxTrainEngine:
         )
 
     def prepare_execution(
+        self, inputs: Mapping[str, Any], targets: Mapping[str, Any]
+    ) -> None:
+        """Prepare a call signature once, joining an in-flight first compile."""
+        with self._prepare_execution_lock:
+            self._prepare_execution_locked(inputs, targets)
+
+    def _prepare_execution_locked(
         self, inputs: Mapping[str, Any], targets: Mapping[str, Any]
     ) -> None:
         """Lower and compile the first micro-step without executing it.

@@ -8,6 +8,11 @@ from typing import Any
 import numpy as np
 from fluxway.common.tensor_backend import HybridBackend
 
+from flare.kernels.backends.cupy_memory import (
+    CupyPoolReclaimer,
+    EagerCupyPoolReclaimer,
+    RetainCupyPoolReclaimer,
+)
 from flare.kernels.contracts import SparseEmbeddingOperator
 from flare.ops.contracts import (
     SparsePooledWidths,
@@ -23,11 +28,24 @@ class CupySparseEmbeddingOperator(SparseEmbeddingOperator):
         value_dtype: str,
         gradient_dtype: str,
         empty_cache: bool = True,
+        memory_reclaimer: CupyPoolReclaimer | None = None,
     ):
         super().__init__(
             HybridBackend(default_device="cuda"), value_dtype, gradient_dtype
         )
+        if memory_reclaimer is not None and not callable(
+            getattr(memory_reclaimer, "after_operation", None)
+        ):
+            raise TypeError("memory_reclaimer must implement after_operation")
+        # The legacy flag selects a default policy; explicit injection wins.
         self.empty_cache = empty_cache
+        self._memory_reclaimer = (
+            memory_reclaimer
+            if memory_reclaimer is not None
+            else EagerCupyPoolReclaimer()
+            if empty_cache
+            else RetainCupyPoolReclaimer()
+        )
         import cupy
 
         self.cp = cupy
@@ -201,6 +219,37 @@ class CupySparseEmbeddingOperator(SparseEmbeddingOperator):
             """,
             "dense_sparse_scatter_pool_add_f32",
         )
+        # One lane owns one pooled gradient element. The gradient stays in a
+        # register while the lane visits its feature's inverse slots; adjacent
+        # lanes read adjacent dimensions and share inverse cache lines in L1.
+        # This avoids launching one lane per padded slot for wide ID lists.
+        self.scatter_pooled_register_kernel = cupy.RawKernel(
+            r"""
+            extern "C" __global__
+            void dense_sparse_scatter_pool_register_f32(
+                float* __restrict__ out,
+                const int* __restrict__ inv,
+                const float* __restrict__ grad,
+                const long long pooled_slots,
+                const int max_elements,
+                const int dim,
+                const int pad_index
+            ) {
+                const long long tid = blockDim.x * blockIdx.x + threadIdx.x;
+                if (tid >= pooled_slots * (long long)dim) return;
+                const int d = (int)(tid % dim);
+                const long long inverse_base = (tid / dim) * (long long)max_elements;
+                const float value = grad[tid];
+                for (int element = 0; element < max_elements; ++element) {
+                    const int row = __ldg(inv + inverse_base + element);
+                    if (row != pad_index) {
+                        atomicAdd(&out[row * (long long)dim + d], value);
+                    }
+                }
+            }
+            """,
+            "dense_sparse_scatter_pool_register_f32",
+        )
         self.stream = cupy.cuda.Stream(non_blocking=True)
         self._block_size = 256
         self._cuda_memset_async = self._load_cuda_memset_async()
@@ -253,6 +302,14 @@ class CupySparseEmbeddingOperator(SparseEmbeddingOperator):
         if hasattr(value, "__jax_array__") or (
             hasattr(value, "__class__") and "jax" in value.__class__.__module__
         ):
+            if (
+                hasattr(value, "__dlpack_device__")
+                and value.__dlpack_device__()[0] == 2
+            ):
+                # Keep CUDA JAX gradients on-device and honor the consumer stream.
+                # np.asarray would synchronize and copy the large sparse gradient
+                # through host memory before uploading it again.
+                return self.cp.from_dlpack(value)
             if hasattr(value, "__cuda_array_interface__"):
                 return self.cp.asarray(value)
             else:
@@ -418,28 +475,52 @@ class CupySparseEmbeddingOperator(SparseEmbeddingOperator):
                 .reshape(-1, feature_count, emb_dim)
             )
             slots = int(inverse.size)
+            pooled_slots = int(gradient.size // emb_dim)
+            if slots != pooled_slots * max_elements:
+                raise ValueError(
+                    "pooled scatter inverse slots must match gradient rows "
+                    "times max_elements"
+                )
             output = self.cp.empty((emb_rows, emb_dim), dtype=self.cp.float32)
             if output.nbytes:
                 self._fast_zero(output, output.nbytes)
             total_elements = slots * emb_dim
             if total_elements == 0:
                 return output.astype(self.cp.dtype(self.gradient_dtype), copy=False)
-            grid_size = (total_elements + self._block_size - 1) // self._block_size
-            self.scatter_pooled_kernel(
-                (grid_size,),
-                (self._block_size,),
-                (
-                    output.data.ptr,
-                    inverse.data.ptr,
-                    gradient.data.ptr,
-                    slots,
-                    feature_count,
-                    max_elements,
-                    emb_dim,
-                    pad_index,
-                ),
-                stream=self.stream,
-            )
+            if max_elements > 1:
+                pooled_elements = pooled_slots * emb_dim
+                grid_size = (pooled_elements + self._block_size - 1) // self._block_size
+                self.scatter_pooled_register_kernel(
+                    (grid_size,),
+                    (self._block_size,),
+                    (
+                        output.data.ptr,
+                        inverse.data.ptr,
+                        gradient.data.ptr,
+                        pooled_slots,
+                        max_elements,
+                        emb_dim,
+                        pad_index,
+                    ),
+                    stream=self.stream,
+                )
+            else:
+                grid_size = (total_elements + self._block_size - 1) // self._block_size
+                self.scatter_pooled_kernel(
+                    (grid_size,),
+                    (self._block_size,),
+                    (
+                        output.data.ptr,
+                        inverse.data.ptr,
+                        gradient.data.ptr,
+                        slots,
+                        feature_count,
+                        max_elements,
+                        emb_dim,
+                        pad_index,
+                    ),
+                    stream=self.stream,
+                )
             return output.astype(self.cp.dtype(self.gradient_dtype), copy=False)
 
     def execution_context(self) -> AbstractContextManager[Any]:
@@ -451,9 +532,7 @@ class CupySparseEmbeddingOperator(SparseEmbeddingOperator):
                 try:
                     yield self.stream
                 finally:
-                    if self.empty_cache:
-                        self.cp.get_default_memory_pool().free_all_blocks()
-                        self.cp.get_default_pinned_memory_pool().free_all_blocks()
+                    self._memory_reclaimer.after_operation(self.cp)
 
         return _context()
 

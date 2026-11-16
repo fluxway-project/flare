@@ -422,9 +422,15 @@ def get_input_spmd_class(
     key_dtype: str,
     sparse_partition_assignment_spec: PartitionSpec,
     pipeline_depth: int = 1,
+    max_rank_step_skew: int = 0,
 ) -> type:
     if pipeline_depth <= 0:
         raise ValueError(f"Input pipeline_depth must be positive, got {pipeline_depth}")
+    if type(max_rank_step_skew) is not int or max_rank_step_skew < 0:
+        raise ValueError(
+            "Input max_rank_step_skew must be a non-negative integer, "
+            f"got {max_rank_step_skew!r}"
+        )
     if not batch_shardings:
         raise ValueError("Input batch_shardings must not be empty")
     require_key_dtype(key_dtype)
@@ -462,6 +468,7 @@ def get_input_spmd_class(
         resource_profile=resource_profile,
         mesh_axis_names=("dp",),
         runtime_env=runtime_env,
+        max_rank_step_skew=max_rank_step_skew,
         process={
             "async_policy": AsyncPolicy.pipelined(
                 depth=pipeline_depth,

@@ -52,7 +52,9 @@ class RowParser:
                 feature.name,
                 feature.length,
                 feature.is_float,
-                parser_spec.float_null_sentinel if feature.is_float else parser_spec.null_sentinel,
+                parser_spec.float_null_sentinel
+                if feature.is_float
+                else parser_spec.null_sentinel,
                 np.float32 if feature.is_float else np.int64,
             )
             for feature in parser_spec.features
@@ -167,7 +169,9 @@ class RowParser:
                     else np.int64(self._spec.null_sentinel)
                 )
                 if feature.length == 1:
-                    feature_buffers[feature.name] = np.full(batch_size, pad, dtype=dtype)
+                    feature_buffers[feature.name] = np.full(
+                        batch_size, pad, dtype=dtype
+                    )
                     feature_buffers.scalar_validity[feature.name] = np.zeros(
                         batch_size, dtype=np.uint8
                     )

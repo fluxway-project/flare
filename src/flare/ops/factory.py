@@ -7,6 +7,7 @@ from flare.ops.contracts import (
 )
 
 if TYPE_CHECKING:
+    from flare.kernels.backends.cupy_memory import CupyPoolReclaimer
     from flare.kernels.contracts import SparseEmbeddingOperator
 
 
@@ -16,6 +17,7 @@ def create_sparse_embedding_operator(
     value_dtype: str,
     gradient_dtype: str,
     empty_cache: bool = False,
+    memory_reclaimer: CupyPoolReclaimer | None = None,
 ) -> SparseEmbeddingOperator:
     if name == "cupy":
         from flare.kernels.backends.gpu_cupy import CupySparseEmbeddingOperator
@@ -24,6 +26,7 @@ def create_sparse_embedding_operator(
             value_dtype=value_dtype,
             gradient_dtype=gradient_dtype,
             empty_cache=empty_cache,
+            memory_reclaimer=memory_reclaimer,
         )
     if name == "cpu_numba":
         from flare.kernels.backends.cpu_numba import CpuNumbaSparseEmbeddingOperator

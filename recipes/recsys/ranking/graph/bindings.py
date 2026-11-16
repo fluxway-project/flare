@@ -85,7 +85,6 @@ def bind_recsys_ranking_training(
         }
         materialize_output[f"emb_ref_{group}"] = {"type": "static", "axis": []}
         bind_input[f"sparse_input_{group}"] = {"type": "static", "axis": []}
-        bind_input[f"padded_inverse_{group}"] = {"type": "static", "axis": []}
         bind_output[f"jax_input_{group}"] = {"type": "static", "axis": []}
         train_input[f"jax_input_{group}"] = {"type": "static", "axis": []}
         train_output[f"grad_jax_{group}"] = {"type": "static", "axis": []}
@@ -124,6 +123,11 @@ def bind_recsys_ranking_training(
         scores={"type": "static", "axis": []},
         loss={"type": "static", "axis": []},
     )
+    # Keep window metadata with the keyed gradients. A direct core -> sparse
+    # update edge would give the sparse commit's transport credit to train_core
+    # and block the next model call even when its inputs are already ready.
+    scatter_input["optimizer_update_window"] = {"type": "static", "axis": []}
+    scatter_output["optimizer_update_window"] = {"type": "static", "axis": []}
     thread_safe = StatePolicy.thread_safe()
 
     def pipelined(phase: str, depth: int = pipeline_depth) -> AsyncPolicy:
