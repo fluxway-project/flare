@@ -18,7 +18,7 @@ class EagerCupyPoolReclaimer:
 
 
 class RetainCupyPoolReclaimer:
-    """Compatibility for callers disabling cleanup; AE11 training does not use it."""
+    """Compatibility for callers disabling cleanup; default production pipelines do not use it."""
 
     def after_operation(self, cupy: Any) -> None:
         return None

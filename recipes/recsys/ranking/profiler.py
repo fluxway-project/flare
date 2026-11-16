@@ -1,4 +1,4 @@
-"""Shared profiler configuration for AE11 and WHW Fluxway jobs."""
+"""Shared profiler configuration for ranking Fluxway jobs."""
 
 from __future__ import annotations
 
